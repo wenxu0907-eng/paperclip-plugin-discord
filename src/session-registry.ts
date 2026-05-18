@@ -274,8 +274,8 @@ export async function spawnAgentInThread(
   let transport: TransportKind = "native";
 
   try {
+    // Do not pass a custom `taskKey` — host's sendMessage/list/close filter on `plugin:${pluginKey}:session:%`, so any user-supplied key becomes invisible to subsequent SDK calls.
     const session = await ctx.agents.sessions.create(agentId, companyId, {
-      taskKey: `discord-thread-${threadId}`,
       reason: `Spawned in Discord thread for: ${taskPrompt.slice(0, 200)}`,
     });
     sessionId = session.sessionId;
