@@ -48,7 +48,7 @@ function resolveBaseUrl(baseUrl?: string): string | null {
 
 export function formatIssueCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
-  const identifier = String(p.identifier ?? event.entityId);
+  const identifier = String(p.identifier ?? p.title ?? event.entityId);
   const title = String(p.title ?? "Untitled");
   const description = p.description ? String(p.description) : null;
   const status = p.status ? String(p.status) : null;
@@ -124,7 +124,7 @@ export function formatIssueCreated(event: PluginEvent, baseUrl?: string): Discor
 
 export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
-  const identifier = String(p.identifier ?? event.entityId);
+  const identifier = String(p.identifier ?? p.title ?? event.entityId);
   const title = String(p.title ?? "") || identifier;
   const status = p.status ? String(p.status) : null;
   const priority = p.priority ? String(p.priority) : null;

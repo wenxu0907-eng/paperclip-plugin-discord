@@ -64,6 +64,13 @@ describe("formatIssueCreated", () => {
     const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");
     expect(viewBtn).toBeUndefined();
   });
+
+  it("falls back to title in headline when identifier is null", () => {
+    const msg = formatIssueCreated(
+      makeEvent({ entityId: "uuid-abc", payload: { title: "Fix login bug" } }),
+    );
+    expect(msg.embeds?.[0]?.title).toBe("Issue Created: Fix login bug");
+  });
 });
 
 describe("formatIssueDone", () => {
@@ -108,6 +115,13 @@ describe("formatIssueDone", () => {
       makeEvent({ entityId: "entity-abc" }),
     );
     expect(msg.embeds?.[0]?.description).toBe("**entity-abc** is now done.");
+  });
+
+  it("falls back to title in headline when identifier is null", () => {
+    const msg = formatIssueDone(
+      makeEvent({ entityId: "uuid-abc", payload: { title: "Fix login bug" } }),
+    );
+    expect(msg.embeds?.[0]?.title).toBe("✅ Issue Completed: Fix login bug");
   });
 });
 
