@@ -185,9 +185,31 @@ describe("formatAgentRunStarted", () => {
     expect(msg.embeds?.[0]?.description).toContain("BD Agent");
   });
 
-  it("falls back to entityId when agentName missing", () => {
-    const msg = formatAgentRunStarted(makeEvent({ entityId: "fallback-agent" }));
-    expect(msg.embeds?.[0]?.description).toContain("fallback-agent");
+  it("falls back to payload.agentId when agentName missing (NOT entityId, which is the run id)", () => {
+    const msg = formatAgentRunStarted(
+      makeEvent({
+        entityId: "run-uuid-should-not-appear",
+        payload: { agentId: "agent-uuid" },
+      }),
+    );
+    expect(msg.embeds?.[0]?.description).toContain("agent-uuid");
+    expect(msg.embeds?.[0]?.description).not.toContain("run-uuid-should-not-appear");
+  });
+
+  it("falls back to event.actorId when neither agentName nor payload.agentId is present", () => {
+    const msg = formatAgentRunStarted(
+      makeEvent({
+        entityId: "run-uuid",
+        // PluginEvent's actorId is the agent id per Paperclip's emission contract
+        actorId: "actor-agent-uuid",
+      } as Partial<PluginEvent>),
+    );
+    expect(msg.embeds?.[0]?.description).toContain("actor-agent-uuid");
+  });
+
+  it("falls back to generic 'Agent' label when no identifying field is available", () => {
+    const msg = formatAgentRunStarted(makeEvent({ entityId: "run-uuid" }));
+    expect(msg.embeds?.[0]?.description).toBe("**Agent** has started a new run.");
   });
 
   it("includes task context when issueIdentifier is provided", () => {

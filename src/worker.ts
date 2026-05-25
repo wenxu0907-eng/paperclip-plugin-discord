@@ -112,6 +112,15 @@ type DiscordConfig = {
 
 type IssueNotificationPayload = Record<string, unknown>;
 
+type AgentRunNotificationPayload = Record<string, unknown> & {
+  runId?: string | null;
+  agentId?: string | null;
+  agentName?: string | null;
+  issueId?: string | null;
+  issueIdentifier?: string | null;
+  issueTitle?: string | null;
+};
+
 // EscalationRecord is imported from ./escalation-state.js
 
 interface EscalationCreatedPayload {
@@ -291,6 +300,64 @@ async function resolveIssueCompanyIdForNotification(
   }
 
   return candidates[0] ?? null;
+}
+
+export async function enrichRunPayload(
+  ctx: PluginContext,
+  event: PluginEvent,
+): Promise<AgentRunNotificationPayload> {
+  const payload: AgentRunNotificationPayload = { ...(event.payload as AgentRunNotificationPayload) };
+
+  // Paperclip's agent.run.* events set:
+  //   entityType: "heartbeat_run", entityId: <run id>, actorId: <agent id>
+  //   payload: { runId, agentId, issueId, status, ... }
+  // The formatter wants agentName + issueIdentifier + issueTitle in the payload.
+  const companyId =
+    (typeof event.companyId === "string" && event.companyId) || null;
+  const agentId =
+    (typeof payload.agentId === "string" && payload.agentId) ||
+    (typeof event.actorId === "string" && event.actorId) ||
+    null;
+  const issueId =
+    (typeof payload.issueId === "string" && payload.issueId) || null;
+
+  if (!companyId) return payload;
+
+  try {
+    if (!payload.agentName && agentId) {
+      const agents = (await ctx.agents.list({ companyId })) as Array<{
+        id: string;
+        name: string;
+      }>;
+      const match = agents.find((a) => a.id === agentId);
+      if (match?.name) payload.agentName = match.name;
+    }
+
+    if (issueId && (!payload.issueIdentifier || !payload.issueTitle)) {
+      const issue = (await ctx.issues.get(issueId, companyId)) as {
+        id: string;
+        identifier?: string | null;
+        title?: string | null;
+      } | null;
+      if (issue) {
+        if (!payload.issueIdentifier) {
+          payload.issueIdentifier = issue.identifier ?? issue.id;
+        }
+        if (!payload.issueTitle && issue.title) {
+          payload.issueTitle = issue.title;
+        }
+      }
+    }
+  } catch (error) {
+    ctx.logger.debug("Agent run notification enrichment failed", {
+      runId: typeof payload.runId === "string" ? payload.runId : event.entityId,
+      agentId,
+      issueId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return payload;
 }
 
 const plugin = definePlugin({
@@ -662,12 +729,14 @@ const plugin = definePlugin({
       );
     }
 
-    ctx.events.on("agent.run.started", (event: PluginEvent) =>
-      notify(event, formatAgentRunStarted, bdPipelineChannelId ?? undefined),
-    );
-    ctx.events.on("agent.run.finished", (event: PluginEvent) =>
-      notify(event, formatAgentRunFinished, bdPipelineChannelId ?? undefined),
-    );
+    ctx.events.on("agent.run.started", async (event: PluginEvent) => {
+      const payload = await enrichRunPayload(ctx, event);
+      await notify({ ...event, payload }, formatAgentRunStarted, bdPipelineChannelId ?? undefined);
+    });
+    ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
+      const payload = await enrichRunPayload(ctx, event);
+      await notify({ ...event, payload }, formatAgentRunFinished, bdPipelineChannelId ?? undefined);
+    });
 
     // ===================================================================
     // Phase 1: Escalation - human-in-the-loop support

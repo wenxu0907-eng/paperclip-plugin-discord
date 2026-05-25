@@ -410,9 +410,21 @@ export function formatBudgetWarning(data: BudgetWarningData): DiscordMessage {
   };
 }
 
+// Pick the best human-readable name for an agent run notification.
+// Paperclip's agent.run.* events set entityId = run id (not agent id), so the
+// previous `event.entityId` fallback produced run UUIDs as agent names. Prefer
+// the actor (agent id from the event envelope) over entityId, and only show a
+// generic label as a last resort.
+function resolveRunAgentLabel(event: PluginEvent, p: Payload): string {
+  if (typeof p.agentName === "string" && p.agentName) return p.agentName;
+  if (typeof p.agentId === "string" && p.agentId) return p.agentId;
+  if (typeof event.actorId === "string" && event.actorId) return event.actorId;
+  return "Agent";
+}
+
 export function formatAgentRunStarted(event: PluginEvent): DiscordMessage {
   const p = event.payload as Payload;
-  const agentName = String(p.agentName ?? event.entityId);
+  const agentName = resolveRunAgentLabel(event, p);
   const issueIdentifier = p.issueIdentifier ? String(p.issueIdentifier) : null;
   const issueTitle = p.issueTitle ? String(p.issueTitle) : null;
 
@@ -435,7 +447,7 @@ export function formatAgentRunStarted(event: PluginEvent): DiscordMessage {
 
 export function formatAgentRunFinished(event: PluginEvent): DiscordMessage {
   const p = event.payload as Payload;
-  const agentName = String(p.agentName ?? event.entityId);
+  const agentName = resolveRunAgentLabel(event, p);
   const issueIdentifier = p.issueIdentifier ? String(p.issueIdentifier) : null;
   const issueTitle = p.issueTitle ? String(p.issueTitle) : null;
 
