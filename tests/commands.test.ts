@@ -85,6 +85,31 @@ describe("handleInteraction", () => {
     );
     expect(ctx.metrics.write).toHaveBeenCalledWith("discord_commands_handled", 1);
   });
+
+  it("ignores slash commands not owned by this plugin (e.g. /status)", async () => {
+    // Discord bot tokens are sometimes shared across applications. The gateway
+    // dispatches INTERACTION_CREATE to every connected client, so this plugin
+    // must ignore commands it does not own — otherwise it falls through to the
+    // "Missing subcommand. Try `/clip status`." branch and hijacks the
+    // legitimate handler's reply.
+    const ctx = makeCtx();
+    const result = await handleInteraction(
+      ctx,
+      { type: 2, data: { name: "status", options: [] } },
+      defaultCmdCtx,
+    );
+    expect(result).toBeUndefined();
+  });
+
+  it("ignores arbitrary unknown slash commands (e.g. /foo)", async () => {
+    const ctx = makeCtx();
+    const result = await handleInteraction(
+      ctx,
+      { type: 2, data: { name: "foo", options: [{ name: "bar" }] } },
+      defaultCmdCtx,
+    );
+    expect(result).toBeUndefined();
+  });
 });
 
 describe("/clip status", () => {

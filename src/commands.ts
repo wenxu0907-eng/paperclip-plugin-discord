@@ -381,6 +381,18 @@ async function handleSlashCommand(
     );
   }
 
+  // Ignore slash commands not owned by this plugin. The Discord bot token may be
+  // shared with other applications (e.g. OpenClaw's discord plugin handles /status,
+  // /agents, etc.), and Discord delivers INTERACTION_CREATE to every connected
+  // client on the gateway. Without this guard, non-/clip commands fall through to
+  // the "Missing subcommand" branch below and respond with a misleading
+  // "Try `/clip status`" message, effectively hijacking the other plugin's reply.
+  // This plugin owns "/clip" (and "/acp", handled above); everything else is
+  // someone else's responsibility.
+  if (data.name !== "clip") {
+    return;
+  }
+
   const subcommand = data.options?.[0];
   if (!subcommand) {
     return respondToInteraction({
