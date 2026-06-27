@@ -17,16 +17,40 @@
  * header carrying a board API key. Pass `apiKey` to attach it. In
  * `local_trusted` deployments unauthenticated requests are implicitly
  * promoted to `board`, so `apiKey` can be omitted.
+ *
+ * Throws on non-2xx responses with a `PaperclipFetchError` carrying
+ * `status` + `headers` so `withRetry` can recognize retryable statuses
+ * (429/500/502/503) without callers needing to call `throwOnRetryableStatus`
+ * inside their `withRetry` callback.
  */
-export function paperclipFetch(
+export class PaperclipFetchError extends Error {
+  status: number;
+  headers: Headers;
+  constructor(message: string, status: number, headers: Headers) {
+    super(message);
+    this.name = "PaperclipFetchError";
+    this.status = status;
+    this.headers = headers;
+  }
+}
+
+export async function paperclipFetch(
   url: string,
   init?: RequestInit,
   apiKey?: string,
 ): Promise<Response> {
-  if (!apiKey) return fetch(url, init);
   const headers = new Headers(init?.headers);
-  if (!headers.has("Authorization")) {
+  if (apiKey && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${apiKey}`);
   }
-  return fetch(url, { ...init, headers });
+  const response = await fetch(url, { ...init, headers });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "<unreadable>");
+    throw new PaperclipFetchError(
+      `paperclipFetch ${init?.method ?? "GET"} ${url} → ${response.status} ${response.statusText}: ${body.slice(0, 200)}`,
+      response.status,
+      response.headers,
+    );
+  }
+  return response;
 }
