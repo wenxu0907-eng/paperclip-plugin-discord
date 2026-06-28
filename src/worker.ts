@@ -369,9 +369,20 @@ const plugin = definePlugin({
       ...(rawConfig as Record<string, unknown>),
     } as DiscordConfig;
 
-    if (!config.discordBotTokenRef) {
-      ctx.logger.warn("No discordBotTokenRef configured, plugin disabled");
-      return;
+    // Hard validation: required config must be present. Failing fast with a
+    // clear, plugin-scoped error is far easier to diagnose than silently
+    // disabling the plugin or falling through to an empty channel id. (issue #53)
+    if (!config.discordBotTokenRef || !String(config.discordBotTokenRef).trim()) {
+      throw new Error(
+        `[${PLUGIN_ID}] discordBotTokenRef is required but is missing or empty. ` +
+          `Configure a Discord bot token reference before enabling the plugin.`,
+      );
+    }
+    if (!config.defaultChannelId || !String(config.defaultChannelId).trim()) {
+      throw new Error(
+        `[${PLUGIN_ID}] defaultChannelId is required but is missing or empty. ` +
+          `Set the default Discord channel ID before enabling the plugin.`,
+      );
     }
 
     const token = await ctx.secrets.resolve(config.discordBotTokenRef);
@@ -1576,11 +1587,19 @@ const plugin = definePlugin({
   },
 
   async onValidateConfig(config) {
-    if (!config.discordBotTokenRef || typeof config.discordBotTokenRef !== "string") {
-      return { ok: false, errors: ["discordBotTokenRef is required"] };
+    if (
+      !config.discordBotTokenRef ||
+      typeof config.discordBotTokenRef !== "string" ||
+      !config.discordBotTokenRef.trim()
+    ) {
+      return { ok: false, errors: [`[${PLUGIN_ID}] discordBotTokenRef is required`] };
     }
-    if (!config.defaultChannelId || typeof config.defaultChannelId !== "string") {
-      return { ok: false, errors: ["defaultChannelId is required"] };
+    if (
+      !config.defaultChannelId ||
+      typeof config.defaultChannelId !== "string" ||
+      !config.defaultChannelId.trim()
+    ) {
+      return { ok: false, errors: [`[${PLUGIN_ID}] defaultChannelId is required`] };
     }
     return { ok: true };
   },
