@@ -128,6 +128,25 @@ export async function connectGateway(
     return DEFAULT_RECONNECT_MS;
   }
 
+  // ws.send throws InvalidStateError ("Sent before connected") if the socket
+  // is CONNECTING (0), CLOSING (2), or CLOSED (3). The heartbeat timer can
+  // outlive the socket it was scheduled against (e.g. after onclose fires
+  // between the interval being set and the next tick), so guard every send.
+  // Returns true if the frame was actually sent.
+  function safeSend(payload: object): boolean {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      ws.send(JSON.stringify(payload));
+      return true;
+    } catch (error) {
+      ctx.logger.warn("Gateway ws.send failed", {
+        readyState: ws.readyState,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
   function connect(url: string, resume: boolean) {
     if (closed) return;
 
@@ -154,12 +173,12 @@ export async function connectGateway(
           startHeartbeat(heartbeatMs);
 
           if (resume && sessionId) {
-            ws?.send(JSON.stringify({
+            safeSend({
               op: 6,
               d: { token: `Bot ${token}`, session_id: sessionId, seq: sequence },
-            }));
+            });
           } else {
-            ws?.send(JSON.stringify({
+            safeSend({
               op: 2,
               d: {
                 token: `Bot ${token}`,
@@ -170,7 +189,7 @@ export async function connectGateway(
                   device: "paperclip-plugin-discord",
                 },
               },
-            }));
+            });
           }
           break;
         }
@@ -215,7 +234,7 @@ export async function connectGateway(
         }
 
         case 1: {
-          ws?.send(JSON.stringify({ op: 1, d: sequence }));
+          safeSend({ op: 1, d: sequence });
           break;
         }
 
@@ -281,7 +300,13 @@ export async function connectGateway(
     if (heartbeatAckTimeout) clearTimeout(heartbeatAckTimeout);
 
     const sendHeartbeat = () => {
-      ws?.send(JSON.stringify({ op: 1, d: sequence }));
+      // If the socket isn't OPEN, skip this tick entirely. Don't schedule an
+      // ack timeout for a frame we never sent — onclose will trigger a
+      // reconnect, which is the correct recovery path. Sending here without
+      // the guard is what caused the long-lived `InvalidStateError: Sent
+      // before connected` crash that took the worker down on 2026-05-12.
+      const sent = safeSend({ op: 1, d: sequence });
+      if (!sent) return;
       heartbeatAckTimeout = setTimeout(() => {
         ctx.logger.warn("Heartbeat ACK not received, forcing reconnect");
         cleanup();
