@@ -44,10 +44,12 @@ import { DiscordAdapter } from "./adapter.js";
 import { processMediaMessage, type MediaAttachment } from "./media-pipeline.js";
 import { registerCommand, parseCommandMessage, executeCommand, listCommands } from "./custom-commands.js";
 import { registerWatch, checkWatches } from "./proactive-suggestions.js";
+import { resolveStartupDiscordBotToken, type DiscordRuntimeHealth } from "./runtime-token.js";
 
 // Module-level state captured during setup() so onWebhook() can reuse it.
 let _pluginCtx: PluginContext | null = null;
 let _cmdCtx: CommandContext | null = null;
+let runtimeHealth: DiscordRuntimeHealth = { status: "ok" };
 
 import { resolveCompanyId } from "./company-resolver.js";
 import {
@@ -385,10 +387,23 @@ const plugin = definePlugin({
       );
     }
 
-    const token = await ctx.secrets.resolve(config.discordBotTokenRef);
-    const paperclipBoardApiKey = config.paperclipBoardApiKeyRef
-      ? await ctx.secrets.resolve(config.paperclipBoardApiKeyRef)
-      : "";
+    const token = await resolveStartupDiscordBotToken(ctx, config.discordBotTokenRef, (health) => {
+      runtimeHealth = health;
+    });
+    if (!token) {
+      ctx.logger.warn("Discord plugin runtime disabled because bot token could not be resolved");
+      return;
+    }
+    let paperclipBoardApiKey = "";
+    if (config.paperclipBoardApiKeyRef) {
+      try {
+        paperclipBoardApiKey = await ctx.secrets.resolve(config.paperclipBoardApiKeyRef);
+      } catch (err) {
+        ctx.logger.warn("Discord plugin could not resolve Paperclip board API key; board features are disabled", {
+          error: String(err),
+        });
+      }
+    }
     const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
     const retentionDays = config.intelligenceRetentionDays || 30;
     const defaultGuildId = normalizeDiscordId(config.defaultGuildId);
@@ -1605,7 +1620,7 @@ const plugin = definePlugin({
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {
-    return { status: "ok" };
+    return runtimeHealth;
   },
 });
 
