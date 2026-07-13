@@ -23,6 +23,17 @@ const PRIORITY_LABELS: Record<string, string> = {
   low: "Low",
 };
 
+// Discord embed field values cap at 1024 chars. Truncate at the field limit and
+// append an ellipsis marker so long agent messages are shown as fully as Discord allows
+// rather than clipped to a thin preview. Shared so every card truncates consistently.
+const EMBED_FIELD_LIMIT = 1024;
+
+export function truncateForField(text: string, limit = EMBED_FIELD_LIMIT): string {
+  if (text.length <= limit) return text;
+  const marker = "… (truncated)";
+  return text.slice(0, limit - marker.length).trimEnd() + marker;
+}
+
 export function humanizeStatus(raw: string): string {
   return STATUS_LABELS[raw] ?? raw;
 }
@@ -138,7 +149,7 @@ export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMe
     explicitCompletedBy || assigneeName || executorName || agentName || assigneeUserId || assigneeAgentId,
   ) || "Unknown";
   const lastComment = p.lastComment ? String(p.lastComment) : null;
-  const summary = lastComment ? lastComment.slice(0, 200) : "No summary available";
+  const summary = lastComment ? truncateForField(lastComment) : "No summary available";
   const parentIdentifier = p.parentIdentifier ? String(p.parentIdentifier) : null;
   const parentTitle = p.parentTitle ? String(p.parentTitle) : null;
   const parentId = p.parentId ? String(p.parentId) : null;
@@ -201,7 +212,7 @@ export function formatIssueInReview(event: PluginEvent, baseUrl?: string): Disco
     assigneeName || executorName || agentName || assigneeUserId || assigneeAgentId,
   ) || "Unknown";
   const lastComment = p.lastComment ? String(p.lastComment) : null;
-  const summary = lastComment ? lastComment.slice(0, 200) : "Ready for your review";
+  const summary = lastComment ? truncateForField(lastComment) : "Ready for your review";
   const parentIdentifier = p.parentIdentifier ? String(p.parentIdentifier) : null;
   const parentTitle = p.parentTitle ? String(p.parentTitle) : null;
 

@@ -238,7 +238,11 @@ async function enrichIssueNotificationPayload(
       if (payload.projectName == null && issue.project?.name) payload.projectName = issue.project.name;
     }
 
-    if (String(payload.status ?? "") === "done") {
+    const notifyStatus = String(payload.status ?? "");
+    // The review and done cards both surface the agent's latest message as the summary,
+    // so enrich lastComment for either status (previously done-only, which left the
+    // "Ready for Review" card with only the thin static fallback string).
+    if (notifyStatus === "done" || notifyStatus === "in_review") {
       const comments = await ctx.issues.listComments(event.entityId, companyId) as Array<{
         authorAgentId?: string | null;
         authorUserId?: string | null;
@@ -247,13 +251,16 @@ async function enrichIssueNotificationPayload(
         updatedAt?: Date | string;
       }>;
       if (comments.length > 0) {
-        const lastComment = [...comments].sort((a, b) => {
+        const sorted = [...comments].sort((a, b) => {
           const aTs = new Date(String(a.updatedAt ?? a.createdAt ?? 0)).getTime();
           const bTs = new Date(String(b.updatedAt ?? b.createdAt ?? 0)).getTime();
           return bTs - aTs;
-        })[0];
+        });
+        // The board wants "the latest message from the agent" — prefer the newest
+        // agent-authored comment, falling back to the newest comment of any author.
+        const lastComment = sorted.find((c) => c.authorAgentId) ?? sorted[0];
         if (payload.lastComment == null) payload.lastComment = lastComment.body;
-        if (payload.completedBy == null) {
+        if (notifyStatus === "done" && payload.completedBy == null) {
           if (lastComment.authorUserId) {
             payload.completedBy = lastComment.authorUserId.startsWith("discord:")
               ? lastComment.authorUserId
@@ -264,7 +271,7 @@ async function enrichIssueNotificationPayload(
         }
       }
 
-      if (payload.completedBy == null) {
+      if (notifyStatus === "done" && payload.completedBy == null) {
         if (typeof payload.assigneeUserId === "string") {
           payload.completedBy = payload.assigneeUserId.startsWith("discord:")
             ? payload.assigneeUserId
