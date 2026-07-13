@@ -19,6 +19,7 @@ import {
 } from "./discord-api.js";
 import {
   formatIssueCreated,
+  formatIssueInReview,
   formatIssueDone,
   formatApprovalCreated,
   formatAgentError,
@@ -70,9 +71,12 @@ type DiscordConfig = {
   errorsChannelId: string;
   bdPipelineChannelId: string;
   notifyOnIssueCreated: boolean;
+  notifyOnIssueInReview: boolean;
   notifyOnIssueDone: boolean;
   notifyOnApprovalCreated: boolean;
   notifyOnAgentError: boolean;
+  notifyOnRunStarted: boolean;
+  notifyOnRunFinished: boolean;
   enableIntelligence: boolean;
   intelligenceChannelIds: string[];
   backfillDays: number;
@@ -659,29 +663,60 @@ const plugin = definePlugin({
       });
     }
 
-    if (config.notifyOnIssueDone) {
+    // A single issue.updated handler covers both the "in review" and "done"
+    // transitions. Each branch is independently gated by its own toggle so the
+    // board can subscribe to review-ready issues, completed issues, or both.
+    if (config.notifyOnIssueInReview || config.notifyOnIssueDone) {
       ctx.events.on("issue.updated", async (event: PluginEvent) => {
         const payload = await enrichIssueNotificationPayload(ctx, event);
-        if (payload.status !== "done") return;
+        const status = payload.status;
 
-        const completionMarker = String(payload.completedAt ?? "");
-        if (completionMarker) {
-          const stateKey = `issue_done_notified_${event.entityId}`;
-          const previousMarker = await ctx.state.get({
-            scopeKind: "instance",
-            stateKey,
-          }) as string | null;
-          if (previousMarker === completionMarker) {
-            ctx.logger.debug(`Skipping duplicate completion notification for ${event.entityId}`);
-            return;
+        if (status === "in_review") {
+          if (!config.notifyOnIssueInReview) return;
+
+          // De-dupe repeated in_review updates keyed on the latest activity
+          // marker so an issue that receives several edits while under review
+          // only pings once per transition into review.
+          const reviewMarker = String(payload.updatedAt ?? payload.lastActivityAt ?? "");
+          if (reviewMarker) {
+            const stateKey = `issue_inreview_notified_${event.entityId}`;
+            const previousMarker = await ctx.state.get({
+              scopeKind: "instance",
+              stateKey,
+            }) as string | null;
+            if (previousMarker === reviewMarker) {
+              ctx.logger.debug(`Skipping duplicate in-review notification for ${event.entityId}`);
+              return;
+            }
+            await ctx.state.set({ scopeKind: "instance", stateKey }, reviewMarker);
           }
-          await ctx.state.set(
-            { scopeKind: "instance", stateKey },
-            completionMarker,
-          );
+
+          await notify({ ...event, payload }, formatIssueInReview);
+          return;
         }
 
-        await notify({ ...event, payload }, formatIssueDone);
+        if (status === "done") {
+          if (!config.notifyOnIssueDone) return;
+
+          const completionMarker = String(payload.completedAt ?? "");
+          if (completionMarker) {
+            const stateKey = `issue_done_notified_${event.entityId}`;
+            const previousMarker = await ctx.state.get({
+              scopeKind: "instance",
+              stateKey,
+            }) as string | null;
+            if (previousMarker === completionMarker) {
+              ctx.logger.debug(`Skipping duplicate completion notification for ${event.entityId}`);
+              return;
+            }
+            await ctx.state.set(
+              { scopeKind: "instance", stateKey },
+              completionMarker,
+            );
+          }
+
+          await notify({ ...event, payload }, formatIssueDone);
+        }
       });
     }
 
@@ -755,14 +790,18 @@ const plugin = definePlugin({
       );
     }
 
-    ctx.events.on("agent.run.started", async (event: PluginEvent) => {
-      const payload = await enrichRunPayload(ctx, event);
-      await notify({ ...event, payload }, formatAgentRunStarted, bdPipelineChannelId ?? undefined);
-    });
-    ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
-      const payload = await enrichRunPayload(ctx, event);
-      await notify({ ...event, payload }, formatAgentRunFinished, bdPipelineChannelId ?? undefined);
-    });
+    if (config.notifyOnRunStarted) {
+      ctx.events.on("agent.run.started", async (event: PluginEvent) => {
+        const payload = await enrichRunPayload(ctx, event);
+        await notify({ ...event, payload }, formatAgentRunStarted, bdPipelineChannelId ?? undefined);
+      });
+    }
+    if (config.notifyOnRunFinished) {
+      ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
+        const payload = await enrichRunPayload(ctx, event);
+        await notify({ ...event, payload }, formatAgentRunFinished, bdPipelineChannelId ?? undefined);
+      });
+    }
 
     // ===================================================================
     // Phase 1: Escalation - human-in-the-loop support

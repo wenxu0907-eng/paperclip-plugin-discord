@@ -186,6 +186,61 @@ export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMe
   };
 }
 
+export function formatIssueInReview(event: PluginEvent, baseUrl?: string): DiscordMessage {
+  const p = event.payload as Payload;
+  const identifier = String(p.identifier ?? p.title ?? event.entityId);
+  const title = String(p.title ?? "") || identifier;
+  const status = p.status ? String(p.status) : null;
+  const priority = p.priority ? String(p.priority) : null;
+  const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
+  const assigneeUserId = p.assigneeUserId ? String(p.assigneeUserId) : null;
+  const executorName = p.executorName ? String(p.executorName) : null;
+  const agentName = p.agentName ? String(p.agentName) : null;
+  const assigneeAgentId = p.assigneeAgentId ? String(p.assigneeAgentId) : null;
+  const submittedBy = humanizeActorLabel(
+    assigneeName || executorName || agentName || assigneeUserId || assigneeAgentId,
+  ) || "Unknown";
+  const lastComment = p.lastComment ? String(p.lastComment) : null;
+  const summary = lastComment ? lastComment.slice(0, 200) : "Ready for your review";
+  const parentIdentifier = p.parentIdentifier ? String(p.parentIdentifier) : null;
+  const parentTitle = p.parentTitle ? String(p.parentTitle) : null;
+
+  const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
+  fields.push({ name: "Submitted by", value: submittedBy, inline: true });
+  if (status) fields.push({ name: "Status", value: `\`${humanizeStatus(status)}\``, inline: true });
+  if (priority) fields.push({ name: "Priority", value: `\`${humanizePriority(priority)}\``, inline: true });
+  fields.push({ name: "Summary", value: summary });
+  if (parentIdentifier) {
+    const parentLine = parentTitle
+      ? `**${parentIdentifier}** — ${parentTitle}`
+      : `**${parentIdentifier}**`;
+    fields.push({ name: "Parent", value: parentLine, inline: true });
+  }
+
+  const base = resolveBaseUrl(baseUrl);
+  const buttons: DiscordComponent[] = [];
+  if (base) {
+    buttons.push({ type: 2, style: 5, label: "Review Issue", url: `${base}/issues/${event.entityId}` });
+  }
+  if (p.prUrl) {
+    buttons.push({ type: 2, style: 5, label: "View Diff", url: String(p.prUrl) });
+  }
+
+  return {
+    embeds: [
+      {
+        title: `👀 Ready for Review: ${identifier}`,
+        description: `**${title}** is now in review.`,
+        color: COLORS.PURPLE,
+        fields,
+        footer: { text: "Paperclip" },
+        timestamp: event.occurredAt,
+      },
+    ],
+    components: buttons.length > 0 ? [{ type: 1, components: buttons }] : [],
+  };
+}
+
 function humanizeActorLabel(value: string | null): string | null {
   if (!value) return null;
   const trimmed = value.trim();
