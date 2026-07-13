@@ -43,6 +43,26 @@ This is that plugin.
 - `escalationChannelId` - Dedicated channel for agent escalations
 - Falls back to `defaultChannelId` when per-type channels aren't configured
 
+### Per-company channel routing (multi-company instances)
+
+A single plugin install can serve every Paperclip company in the instance and
+deliver each company's notifications to its own Discord channel:
+
+- Configure **one** plugin config (instance-level) with a single bot token that
+  is a member of every target guild/channel. The same bot posting into channels
+  it can see is all that's required — you do **not** need a separate config per
+  company.
+- Set `companyChannels` to a `{ "<companyId>": "<channelId>" }` map. Every event
+  is routed to the channel for its own `companyId`; companies absent from the map
+  fall back to `defaultChannelId`.
+- Per-company overrides can also be set at runtime with `/clip connect-channel`
+  (stored in company-scoped state, checked before `companyChannels`).
+
+Notifications are **not** locked to a single company — events for every company
+are delivered, each to its resolved channel. (See
+`tests/multi-company-routing.test.ts`, which guards against a past regression
+where a single-company gate dropped notifications for all but the first company.)
+
 ### Slash commands
 - `/clip status` - Show active agents and recent completions
 - `/clip approve <id>` - Approve a pending approval
