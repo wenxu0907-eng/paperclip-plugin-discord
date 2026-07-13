@@ -114,10 +114,31 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Notify on issue created",
         default: DEFAULT_CONFIG.notifyOnIssueCreated,
       },
+      notifyOnIssueInReview: {
+        type: "boolean",
+        title: "Notify when an issue is ready for review",
+        description:
+          "Post a Discord message when an issue you assigned moves into 'in review' status, so you know work is awaiting your review.",
+        default: DEFAULT_CONFIG.notifyOnIssueInReview,
+      },
       notifyOnIssueDone: {
         type: "boolean",
         title: "Notify on issue completed",
         default: DEFAULT_CONFIG.notifyOnIssueDone,
+      },
+      notifyOnRunStarted: {
+        type: "boolean",
+        title: "Notify when an agent run starts",
+        description:
+          "High-frequency, low-signal. Leave off unless you want a message every time an agent begins working.",
+        default: DEFAULT_CONFIG.notifyOnRunStarted,
+      },
+      notifyOnRunFinished: {
+        type: "boolean",
+        title: "Notify when an agent run finishes",
+        description:
+          "High-frequency, low-signal. Leave off unless you want a message every time an agent finishes a run.",
+        default: DEFAULT_CONFIG.notifyOnRunFinished,
       },
       notifyOnApprovalCreated: {
         type: "boolean",

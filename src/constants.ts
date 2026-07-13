@@ -22,9 +22,14 @@ export const DEFAULT_CONFIG = {
   errorsChannelId: "",
   bdPipelineChannelId: "",
   notifyOnIssueCreated: true,
+  notifyOnIssueInReview: true,
   notifyOnIssueDone: true,
   notifyOnApprovalCreated: true,
   notifyOnAgentError: true,
+  // Agent run lifecycle events are high-frequency, low-signal. Default them
+  // OFF so the board only hears about them if it opts in via the UI toggles.
+  notifyOnRunStarted: false,
+  notifyOnRunFinished: false,
   enableIntelligence: false,
   intelligenceChannelIds: [] as string[],
   escalationChannelId: "",
