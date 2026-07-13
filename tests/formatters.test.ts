@@ -538,14 +538,26 @@ describe("formatIssueDone — actionability improvements", () => {
     expect(field?.value).toBe("Engineer");
   });
 
-  it("includes Summary field from lastComment, truncated to 200 chars", () => {
-    const longComment = "x".repeat(300);
+  it("includes Summary field from lastComment, truncated to the Discord field limit with an ellipsis", () => {
+    const longComment = "x".repeat(2000);
     const msg = formatIssueDone(
       makeEvent({ payload: { identifier: "X-2", title: "T", lastComment: longComment } }),
     );
     const field = msg.embeds?.[0]?.fields?.find((f) => f.name === "Summary");
     expect(field).toBeDefined();
-    expect(field!.value.length).toBeLessThanOrEqual(200);
+    // Full agent message shown up to Discord's 1024-char field cap (not the old thin 200 preview).
+    expect(field!.value.length).toBeLessThanOrEqual(1024);
+    expect(field!.value.length).toBeGreaterThan(200);
+    expect(field!.value.endsWith("… (truncated)")).toBe(true);
+  });
+
+  it("shows a short lastComment in full without a truncation marker", () => {
+    const shortComment = "Ready — PR #12 merged, CI green.";
+    const msg = formatIssueDone(
+      makeEvent({ payload: { identifier: "X-2b", title: "T", lastComment: shortComment } }),
+    );
+    const field = msg.embeds?.[0]?.fields?.find((f) => f.name === "Summary");
+    expect(field?.value).toBe(shortComment);
   });
 
   it("includes Parent field when parentIdentifier is provided", () => {
