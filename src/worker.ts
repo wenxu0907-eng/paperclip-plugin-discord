@@ -155,6 +155,90 @@ function normalizeDiscordIdList(values: unknown): string[] {
     .filter((value): value is string => value !== null);
 }
 
+// ---------------------------------------------------------------------------
+// Company-scoped host compatibility (COM-108 / COM-118)
+//
+// Paperclip plugin config is stored PER COMPANY, not instance-wide. The host
+// hands workers an empty bootstrap config and expects them to call
+// `ctx.config.get({ companyId })` for scoped values, and to resolve secret
+// references with `ctx.secrets.resolve(ref, { companyId, configPath })` so the
+// per-company secret binding (companySecretBindings) can be located.
+// See server: `plugin-loader.ts` ("must call ctx.config.get({ companyId })")
+// and `plugin-secrets-handler.ts` (PluginSecretsResolveParams companyId/configPath).
+//
+// The published SDK `.d.ts` under-declares these params (config.get() takes no
+// args, secrets.resolve(ref) takes only the ref), so we widen the call sites
+// locally. The arg-less forms return `{}` / fail secret resolution on this host,
+// which previously took the whole plugin down at boot (empty config -> throw)
+// and disabled runtime (secret resolve failure). These types restore the
+// host-supported behavior without editing the SDK.
+// ---------------------------------------------------------------------------
+type ScopedConfigGet = (params?: { companyId?: string }) => Promise<Record<string, unknown>>;
+type ScopedSecretResolve = (
+  secretRef: string,
+  opts?: { companyId?: string; configPath?: string },
+) => Promise<string>;
+
+export interface CompanyScopedRuntimeConfig {
+  companyId: string;
+  rawConfig: Record<string, unknown>;
+  config: DiscordConfig;
+  token: string;
+  paperclipBoardApiKey: string;
+}
+
+/**
+ * Resolve the Discord runtime config from the first company that has a complete
+ * Discord configuration (bot token ref + default channel). Iterates every
+ * company because plugin config is company-scoped; the instance-level
+ * `ctx.config.get()` returns an empty object on this host.
+ *
+ * Returns `null` (rather than throwing) when no company is configured, so the
+ * plugin disables cleanly instead of crash-looping the worker.
+ */
+export async function getCompanyScopedRuntimeConfig(
+  ctx: PluginContext,
+  preferredCompanyId?: string,
+): Promise<CompanyScopedRuntimeConfig | null> {
+  const scopedConfigGet = ctx.config.get as unknown as ScopedConfigGet;
+  const scopedSecretResolve = ctx.secrets.resolve as unknown as ScopedSecretResolve;
+
+  const candidates: string[] = [];
+  if (preferredCompanyId) candidates.push(preferredCompanyId);
+  try {
+    const companies = await ctx.companies.list();
+    for (const company of companies) {
+      if (company?.id && !candidates.includes(company.id)) candidates.push(company.id);
+    }
+  } catch (err) {
+    ctx.logger.warn("Unable to list companies while loading Discord config", { error: String(err) });
+  }
+
+  for (const companyId of candidates) {
+    try {
+      const rawConfig = (await scopedConfigGet({ companyId })) ?? {};
+      const config = { ...DEFAULT_CONFIG, ...rawConfig } as DiscordConfig;
+      if (!config.discordBotTokenRef || !config.defaultChannelId) continue;
+
+      const token = await scopedSecretResolve(config.discordBotTokenRef, {
+        companyId,
+        configPath: "discordBotTokenRef",
+      });
+      const paperclipBoardApiKey = config.paperclipBoardApiKeyRef
+        ? await scopedSecretResolve(config.paperclipBoardApiKeyRef, {
+            companyId,
+            configPath: "paperclipBoardApiKeyRef",
+          })
+        : "";
+      return { companyId, rawConfig, config, token, paperclipBoardApiKey };
+    } catch (err) {
+      ctx.logger.warn("Unable to load Discord config for company", { companyId, error: String(err) });
+    }
+  }
+
+  return null;
+}
+
 async function resolveChannel(
   ctx: PluginContext,
   companyId: string,
@@ -177,7 +261,8 @@ async function resolveChannel(
   // 3. General `companyChannels` map from plugin config — applies to every event type
   //    that does not have its own specific map.
   try {
-    const rawConfig = (await ctx.config.get?.()) as DiscordConfig | undefined;
+    const scopedConfigGet = ctx.config.get as unknown as ScopedConfigGet | undefined;
+    const rawConfig = (await scopedConfigGet?.({ companyId })) as DiscordConfig | undefined;
     const general = rawConfig?.companyChannels;
     if (general && companyId && general[companyId]) {
       return normalizeDiscordId(general[companyId]);
@@ -375,46 +460,74 @@ export async function enrichRunPayload(
 
 const plugin = definePlugin({
   async setup(ctx) {
-    const rawConfig = await ctx.config.get();
-    ctx.logger.info(`Discord plugin config: ${JSON.stringify(rawConfig)}`);
-    const config = {
-      ...DEFAULT_CONFIG,
-      ...(rawConfig as Record<string, unknown>),
-    } as DiscordConfig;
+    _pluginCtx = ctx;
 
-    // Hard validation: required config must be present. Failing fast with a
-    // clear, plugin-scoped error is far easier to diagnose than silently
-    // disabling the plugin or falling through to an empty channel id. (issue #53)
-    if (!config.discordBotTokenRef || !String(config.discordBotTokenRef).trim()) {
-      throw new Error(
-        `[${PLUGIN_ID}] discordBotTokenRef is required but is missing or empty. ` +
-          `Configure a Discord bot token reference before enabling the plugin.`,
-      );
-    }
-    if (!config.defaultChannelId || !String(config.defaultChannelId).trim()) {
-      throw new Error(
-        `[${PLUGIN_ID}] defaultChannelId is required but is missing or empty. ` +
-          `Set the default Discord channel ID before enabling the plugin.`,
-      );
-    }
+    // --- Primary path: company-scoped runtime config (COM-108 / COM-118) ---
+    // Plugin config is stored per-company on this host; the instance-level
+    // ctx.config.get() returns {} which used to make setup() throw at boot
+    // (total Discord outage). Resolve the first fully-configured company and
+    // scope its bot token / board API key secret resolution to that company.
+    const scoped = await getCompanyScopedRuntimeConfig(ctx);
 
-    const token = await resolveStartupDiscordBotToken(ctx, config.discordBotTokenRef, (health) => {
-      runtimeHealth = health;
-    });
-    if (!token) {
-      ctx.logger.warn("Discord plugin runtime disabled because bot token could not be resolved");
-      return;
-    }
+    let config: DiscordConfig;
+    let token: string;
     let paperclipBoardApiKey = "";
-    if (config.paperclipBoardApiKeyRef) {
-      try {
-        paperclipBoardApiKey = await ctx.secrets.resolve(config.paperclipBoardApiKeyRef);
-      } catch (err) {
-        ctx.logger.warn("Discord plugin could not resolve Paperclip board API key; board features are disabled", {
-          error: String(err),
-        });
+    // The company that owns the resolved config; runtime jobs still resolve the
+    // per-event company via resolveCompanyId(ctx)/event.companyId.
+    let scopedCompanyId = "default";
+
+    if (scoped) {
+      config = scoped.config;
+      token = scoped.token;
+      paperclipBoardApiKey = scoped.paperclipBoardApiKey;
+      scopedCompanyId = scoped.companyId;
+      runtimeHealth = { status: "ok" };
+      ctx.logger.info(
+        `Discord plugin company config loaded: ${JSON.stringify({ companyId: scoped.companyId, rawConfig: scoped.rawConfig })}`,
+      );
+    } else {
+      // --- Fallback path: instance-level config (single-tenant / legacy host) ---
+      const rawConfig = await ctx.config.get();
+      ctx.logger.info(`Discord plugin config: ${JSON.stringify(rawConfig)}`);
+      config = {
+        ...DEFAULT_CONFIG,
+        ...(rawConfig as Record<string, unknown>),
+      } as DiscordConfig;
+
+      // Hard validation: when there is no company-scoped config AND no instance
+      // config, fail fast with a clear, plugin-scoped error. (issue #53)
+      if (!config.discordBotTokenRef || !String(config.discordBotTokenRef).trim()) {
+        throw new Error(
+          `[${PLUGIN_ID}] discordBotTokenRef is required but is missing or empty. ` +
+            `Configure a Discord bot token reference before enabling the plugin.`,
+        );
+      }
+      if (!config.defaultChannelId || !String(config.defaultChannelId).trim()) {
+        throw new Error(
+          `[${PLUGIN_ID}] defaultChannelId is required but is missing or empty. ` +
+            `Set the default Discord channel ID before enabling the plugin.`,
+        );
+      }
+
+      const resolvedToken = await resolveStartupDiscordBotToken(ctx, config.discordBotTokenRef, (health) => {
+        runtimeHealth = health;
+      });
+      if (!resolvedToken) {
+        ctx.logger.warn("Discord plugin runtime disabled because bot token could not be resolved");
+        return;
+      }
+      token = resolvedToken;
+      if (config.paperclipBoardApiKeyRef) {
+        try {
+          paperclipBoardApiKey = await ctx.secrets.resolve(config.paperclipBoardApiKeyRef);
+        } catch (err) {
+          ctx.logger.warn("Discord plugin could not resolve Paperclip board API key; board features are disabled", {
+            error: String(err),
+          });
+        }
       }
     }
+
     const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
     const retentionDays = config.intelligenceRetentionDays || 30;
     const defaultGuildId = normalizeDiscordId(config.defaultGuildId);
@@ -425,9 +538,10 @@ const plugin = definePlugin({
     const escalationChannelId = normalizeDiscordId(config.escalationChannelId) ?? defaultChannelId;
     const intelligenceChannelIds = normalizeDiscordIdList(config.intelligenceChannelIds);
 
-    // Company ID is resolved lazily on first /clip command or job invocation,
-    // NOT during setup — startup-time API calls can cause worker activation to fail.
-    const companyId = "default"; // placeholder; jobs use resolveCompanyId(ctx) at runtime
+    // Seed the command context with the company that owns the resolved config.
+    // Per-event/per-job company is still resolved via resolveCompanyId(ctx) /
+    // event.companyId at runtime; this is only the default fallback scope.
+    const companyId = scopedCompanyId;
 
     const cmdCtx: CommandContext = {
       baseUrl,
@@ -439,7 +553,6 @@ const plugin = definePlugin({
     };
 
     // Store context at module level so onWebhook() can reuse it.
-    _pluginCtx = ctx;
     _cmdCtx = cmdCtx;
 
     // --- Register slash commands with Discord ---
