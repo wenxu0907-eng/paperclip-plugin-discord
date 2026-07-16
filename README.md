@@ -186,6 +186,23 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -d '{"packageName":"paperclip-plugin-discord"}'
 ```
 
+### Bundled SDK compatibility patch (company-scoped config/secrets)
+
+The published `@paperclipai/plugin-sdk@2026.707.0` worker RPC client drops two
+host arguments: `config.get()` never forwards `params` (so `companyId` is lost and
+the host returns `{}`), and `secrets.resolve()` never forwards `options` (so
+`companyId`/`configPath` are lost and the host rejects the ref with *"Plugin secret
+references are disabled until company-scoped plugin config lands"*). On hosts that
+enforce company-scoped plugin config this makes the worker fail to boot for every
+company. This package carries a version-controlled [`patch-package`](https://www.npmjs.com/package/patch-package)
+fix (`patches/@paperclipai+plugin-sdk+2026.707.0.patch`) applied automatically via
+`postinstall`, so the compatibility fix survives every `npm install` instead of
+living as an undocumented hand-edit in `node_modules`.
+
+> If the SDK is **hoisted** to a workspace/runtime root (e.g. `~/.paperclip/plugins/`),
+> run `npx patch-package` once at that root after any reinstall, since `postinstall`
+> resolves patches relative to the install root, not this package's own directory.
+
 > **Note — `paperclipai` master, post [#5429](https://github.com/paperclipai/paperclip/pull/5429) (2026-05-09):**
 > The new Secrets Manager ships with a temporary kill switch on plugin secret-ref UUIDs while a company-scoped `plugin_config` follow-up lands. If you're running paperclipai master, plugin activation will fail with `Plugin secret references are disabled until company-scoped plugin config lands`, and `POST /api/plugins/:id/config` returns HTTP 422 for configs containing secret-ref UUIDs (e.g. `discordBotTokenRef`). This is intentional fail-closed mitigation (PAP-2394 — see the [upstream plan doc](https://github.com/paperclipai/paperclip/blob/master/doc/plans/2026-04-26-plugin-secret-ref-company-scope.md)). Until the follow-up lands, pin to the last paperclipai release before #5429. This callout will be removed once secret-ref resolution is restored.
 

@@ -1,6 +1,6 @@
 {
   "name": "paperclip-plugin-discord",
-  "version": "0.9.8",
+  "version": "0.9.9",
   "type": "module",
   "main": "./dist/index.js",
   "paperclipPlugin": {
@@ -13,20 +13,26 @@
     "dev": "tsc --watch",
     "test": "vitest run",
     "prepublishOnly": "npm run build",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "postinstall": "patch-package"
   },
   "peerDependencies": {
     "@paperclipai/plugin-sdk": "*",
     "@paperclipai/shared": "*"
   },
+  "dependencies": {
+    "patch-package": "^8.0.1"
+  },
   "devDependencies": {
     "@paperclipai/plugin-sdk": "^2026.707.0",
     "@paperclipai/shared": "^2026.707.0",
+    "patch-package": "^8.0.1",
     "typescript": "^5.7.0",
     "vitest": "^3.2.6"
   },
   "files": [
-    "dist/"
+    "dist/",
+    "patches/"
   ],
   "repository": {
     "type": "git",
