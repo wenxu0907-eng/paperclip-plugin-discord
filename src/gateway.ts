@@ -6,6 +6,11 @@ const GATEWAY_ENCODING = "json";
 const MAX_CONSECUTIVE_FAILURES = 5;
 const MAX_BACKOFF_MS = 60_000;
 const DEFAULT_RECONNECT_MS = 5000;
+// Base delay for the exponential-backoff schedule applied to every failed
+// reconnect (including Invalid Session op 9). Discord force-resets a bot token
+// once it opens ~1000 gateway sessions in a day, so a persistently failing
+// session must back off aggressively rather than retry every 1-5s.
+const BASE_BACKOFF_MS = 2000;
 const GUILD_INTENT = 1;
 const GUILD_MESSAGES_INTENT = 512;
 const MESSAGE_CONTENT_INTENT = 32768;
@@ -122,10 +127,19 @@ export async function connectGateway(
     (includeMessageContent ? MESSAGE_CONTENT_INTENT : 0);
 
   function getReconnectDelay(): number {
-    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      return MAX_BACKOFF_MS;
-    }
-    return DEFAULT_RECONNECT_MS;
+    // Exponential backoff with full jitter, capped at MAX_BACKOFF_MS. Previously
+    // this returned a flat DEFAULT_RECONNECT_MS until MAX_CONSECUTIVE_FAILURES,
+    // and the Invalid Session (op 9) path ignored it entirely and retried every
+    // 1-5s. A session that could never succeed (revoked token, or a shared token
+    // being evicted by another company's worker) therefore hammered IDENTIFY and
+    // tripped Discord's ~1000-sessions/day reset. Backoff now grows on every
+    // failure so a stuck worker cannot storm the gateway.
+    const exp = Math.min(
+      MAX_BACKOFF_MS,
+      BASE_BACKOFF_MS * 2 ** Math.min(consecutiveFailures, 10),
+    );
+    // Full jitter: random point in [exp/2, exp] to de-correlate concurrent workers.
+    return Math.floor(exp / 2 + Math.random() * (exp / 2));
   }
 
   // ws.send throws InvalidStateError ("Sent before connected") if the socket
@@ -256,7 +270,15 @@ export async function connectGateway(
           }
           consecutiveFailures++;
           await ctx.metrics.write(METRIC_NAMES.gatewayReconnections, 1);
-          const delay = 1000 + Math.random() * 4000;
+          // Use the shared exponential-backoff schedule. A repeatedly-invalid
+          // session (e.g. shared-token eviction) must not re-IDENTIFY every 1-5s.
+          const delay = getReconnectDelay();
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            ctx.logger.error("Gateway invalid-session loop, backing off", {
+              consecutiveFailures,
+              delayMs: delay,
+            });
+          }
           setTimeout(() => connect(url, resumable), delay);
           break;
         }
