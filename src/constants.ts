@@ -42,6 +42,10 @@ export const DEFAULT_CONFIG = {
   proactiveScanIntervalMinutes: 15,
   enableCommands: true,
   enableInbound: true,
+  // Open a gateway (WebSocket) session by default. When multiple companies share
+  // one bot token, set this false on all but one to avoid an IDENTIFY storm that
+  // trips Discord's ~1000-sessions/day token reset. See DiscordConfig.enableGateway.
+  enableGateway: true,
   topicRouting: false,
   digestMode: "off" as string,
   dailyDigestTime: "09:00",

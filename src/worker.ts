@@ -93,6 +93,17 @@ type DiscordConfig = {
   proactiveScanIntervalMinutes: number;
   enableCommands: boolean;
   enableInbound: boolean;
+  /**
+   * Whether this company's worker opens its own Discord Gateway (WebSocket)
+   * connection. A single bot token permits only one active unsharded gateway
+   * session, so when several companies share one token they evict each other
+   * and storm IDENTIFY until Discord force-resets the token. Enable the gateway
+   * on exactly ONE company; the others deliver notifications and register slash
+   * commands over REST (no IDENTIFY) and let the shared-gateway company route
+   * inbound interactions for every guild the bot is in. Defaults to true for
+   * backward compatibility.
+   */
+  enableGateway: boolean;
   topicRouting: boolean;
   digestMode: string;
   dailyDigestTime: string;
@@ -667,18 +678,31 @@ const plugin = definePlugin({
       config.enableIntelligence === true;
 
     // --- Gateway connection for real-time interaction handling ---
-    const gateway = await connectGateway(
-      ctx,
-      token,
-      async (interaction) => {
-        return handleInteraction(ctx, interaction as any, cmdCtx);
-      },
-      gatewayNeedsMessages ? handleMessageCreate : undefined,
-      {
-        listenForMessages: gatewayNeedsMessages,
-        includeMessageContent: gatewayNeedsMessages,
-      },
-    );
+    // A bot token allows only one active unsharded gateway session. When several
+    // companies share a token, enable the gateway on exactly one of them; the
+    // rest run REST-only (notifications + slash-command registration) so they
+    // never send IDENTIFY. The shared-gateway company receives interactions for
+    // every guild the bot is in and routes them by company.
+    const gatewayEnabled = config.enableGateway !== false;
+    const gateway = gatewayEnabled
+      ? await connectGateway(
+          ctx,
+          token,
+          async (interaction) => {
+            return handleInteraction(ctx, interaction as any, cmdCtx);
+          },
+          gatewayNeedsMessages ? handleMessageCreate : undefined,
+          {
+            listenForMessages: gatewayNeedsMessages,
+            includeMessageContent: gatewayNeedsMessages,
+          },
+        )
+      : (ctx.logger.info(
+          "Discord gateway disabled for this company (enableGateway=false); " +
+            "notifications and slash-command registration continue over REST, " +
+            "inbound interactions are served by the shared-gateway company.",
+        ),
+        { close: () => {} });
 
     ctx.events.on("plugin.stopping", async () => {
       gateway.close();

@@ -268,6 +268,13 @@ const manifest: PaperclipPluginManifestV1 = {
           "Route Discord replies to bot notifications back to Paperclip as issue comments or escalation responses.",
         default: DEFAULT_CONFIG.enableInbound,
       },
+      enableGateway: {
+        type: "boolean",
+        title: "Open Discord Gateway connection",
+        description:
+          "Open a realtime Gateway (WebSocket) session for this company. A bot token allows only ONE active gateway session, so if several companies share one token, enable this on exactly one company and turn it OFF on the rest — otherwise the workers evict each other and storm IDENTIFY until Discord force-resets the token. Companies with this off still send notifications and register slash commands over REST; the single gateway company routes inbound interactions for all shared guilds.",
+        default: DEFAULT_CONFIG.enableGateway,
+      },
       topicRouting: {
         type: "boolean",
         title: "Enable topic/channel routing",
