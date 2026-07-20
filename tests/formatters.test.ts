@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   formatIssueCreated,
   formatIssueDone,
+  formatIssueBlocked,
   formatApprovalCreated,
   formatAgentError,
   formatSessionFailure,
@@ -122,6 +123,50 @@ describe("formatIssueDone", () => {
       makeEvent({ entityId: "uuid-abc", payload: { title: "Fix login bug" } }),
     );
     expect(msg.embeds?.[0]?.title).toBe("✅ Issue Completed: Fix login bug");
+  });
+});
+
+describe("formatIssueBlocked", () => {
+  it("uses red color and blocked headline", () => {
+    const msg = formatIssueBlocked(
+      makeEvent({ payload: { identifier: "PROJ-42", title: "Fix login bug" } }),
+    );
+    expect(msg.embeds?.[0]?.color).toBe(COLORS.RED);
+    expect(msg.embeds?.[0]?.title).toBe("🚫 Blocked: PROJ-42");
+    expect(msg.embeds?.[0]?.description).toBe("**Fix login bug** is blocked and needs attention.");
+  });
+
+  it("surfaces the blocker reason when present", () => {
+    const msg = formatIssueBlocked(
+      makeEvent({ payload: { identifier: "PROJ-42", blockerReason: "Waiting on API key from board" } }),
+    );
+    const blockerField = msg.embeds?.[0]?.fields?.find((f) => f.name === "Blocker");
+    expect(blockerField?.value).toBe("Waiting on API key from board");
+  });
+
+  it("falls back to the latest comment when no blocker reason is set", () => {
+    const msg = formatIssueBlocked(
+      makeEvent({ payload: { identifier: "PROJ-42", lastComment: "Blocked pending vendor response" } }),
+    );
+    const blockerField = msg.embeds?.[0]?.fields?.find((f) => f.name === "Blocker");
+    expect(blockerField?.value).toBe("Blocked pending vendor response");
+  });
+
+  it("shows a placeholder when neither reason nor comment is available", () => {
+    const msg = formatIssueBlocked(
+      makeEvent({ payload: { identifier: "PROJ-42" } }),
+    );
+    const blockerField = msg.embeds?.[0]?.fields?.find((f) => f.name === "Blocker");
+    expect(blockerField?.value).toBe("No blocker reason provided");
+  });
+
+  it("includes a View Issue button when base URL is provided", () => {
+    const msg = formatIssueBlocked(
+      makeEvent({ entityId: "iss-9" }),
+      "https://app.paperclip.dev",
+    );
+    const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");
+    expect(viewBtn?.url).toBe("https://app.paperclip.dev/issues/iss-9");
   });
 });
 

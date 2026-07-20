@@ -126,6 +126,13 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Notify on issue completed",
         default: DEFAULT_CONFIG.notifyOnIssueDone,
       },
+      notifyOnIssueBlocked: {
+        type: "boolean",
+        title: "Notify when an issue is blocked",
+        description:
+          "Post a Discord message when an issue moves into 'blocked' status, so you can unblock it. Includes the blocker reason when one is set.",
+        default: DEFAULT_CONFIG.notifyOnIssueBlocked,
+      },
       notifyOnRunStarted: {
         type: "boolean",
         title: "Notify when an agent run starts",
