@@ -1069,13 +1069,148 @@ describe("autocomplete (interaction type 4)", () => {
   });
 });
 
+describe("/clip assign", () => {
+  const okCreate = (identifier = "ONB-42") => ({
+    ok: true,
+    status: 200,
+    headers: new Headers(),
+    text: () => Promise.resolve(""),
+    json: () => Promise.resolve({ identifier, id: "iss-1" }),
+  });
+
+  function assignInteraction(
+    options: Array<{ name: string; value?: string | number }>,
+    channelId?: string,
+  ) {
+    return {
+      type: 2,
+      data: { name: "clip", options: [{ name: "assign", options }] },
+      member: { user: { username: "testuser" } },
+      channel_id: channelId,
+    };
+  }
+
+  it("rejects when title is missing", async () => {
+    const ctx = makeCtx();
+    const result = (await handleInteraction(ctx, assignInteraction([], "ch-1"), defaultCmdCtx)) as any;
+    expect(result.data.content).toContain("Missing title");
+    expect(mockPaperclipFetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects when the channel is not connected to a project", async () => {
+    const ctx = makeCtx({
+      state: { get: vi.fn().mockResolvedValue({}), set: vi.fn() },
+      projects: { list: vi.fn().mockResolvedValue([{ id: "p1", name: "Onboarding" }]) },
+    });
+    const result = (await handleInteraction(
+      ctx,
+      assignInteraction([{ name: "title", value: "Do X" }], "ch-1"),
+      defaultCmdCtx,
+    )) as any;
+    expect(result.data.content).toContain("isn't connected to a Paperclip project");
+    expect(mockPaperclipFetch).not.toHaveBeenCalled();
+  });
+
+  it("creates an unassigned issue in the channel's mapped project", async () => {
+    mockPaperclipFetch.mockResolvedValue(okCreate("ONB-42"));
+    const ctx = makeCtx({
+      state: { get: vi.fn().mockResolvedValue({ Onboarding: "ch-1" }), set: vi.fn() },
+      projects: { list: vi.fn().mockResolvedValue([{ id: "p1", name: "Onboarding" }]) },
+    });
+    const result = (await handleInteraction(
+      ctx,
+      assignInteraction([{ name: "title", value: "Do X" }], "ch-1"),
+      defaultCmdCtx,
+    )) as any;
+    expect(mockPaperclipFetch).toHaveBeenCalledWith(
+      "http://localhost:3100/api/companies/default/issues",
+      expect.objectContaining({ method: "POST" }),
+      expect.anything(),
+    );
+    const body = JSON.parse(mockPaperclipFetch.mock.calls[0][1].body);
+    expect(body.projectId).toBe("p1");
+    expect(body.title).toBe("Do X");
+    expect(body.priority).toBe("medium");
+    expect(body.assigneeAgentId).toBeUndefined();
+    expect(result.data.embeds[0].title).toContain("ONB-42");
+    expect(result.data.embeds[0].fields.find((f: any) => f.name === "Assignee").value).toContain("unassigned");
+  });
+
+  it("assigns to a named agent and honors priority", async () => {
+    mockPaperclipFetch.mockResolvedValue(okCreate("ONB-43"));
+    const ctx = makeCtx({
+      state: { get: vi.fn().mockResolvedValue({ Onboarding: "ch-1" }), set: vi.fn() },
+      projects: { list: vi.fn().mockResolvedValue([{ id: "p1", name: "Onboarding" }]) },
+      agents: { list: vi.fn().mockResolvedValue([{ id: "a1", name: "CEO", role: "ceo" }]) },
+    });
+    const result = (await handleInteraction(
+      ctx,
+      assignInteraction(
+        [
+          { name: "title", value: "Do Y" },
+          { name: "agent", value: "CEO" },
+          { name: "priority", value: "high" },
+        ],
+        "ch-1",
+      ),
+      defaultCmdCtx,
+    )) as any;
+    const body = JSON.parse(mockPaperclipFetch.mock.calls[0][1].body);
+    expect(body.assigneeAgentId).toBe("a1");
+    expect(body.priority).toBe("high");
+    expect(result.data.embeds[0].fields.find((f: any) => f.name === "Assignee").value).toBe("CEO");
+  });
+
+  it("rejects an unknown agent without creating the issue", async () => {
+    const ctx = makeCtx({
+      state: { get: vi.fn().mockResolvedValue({ Onboarding: "ch-1" }), set: vi.fn() },
+      projects: { list: vi.fn().mockResolvedValue([{ id: "p1", name: "Onboarding" }]) },
+      agents: { list: vi.fn().mockResolvedValue([{ id: "a1", name: "CEO", role: "ceo" }]) },
+    });
+    const result = (await handleInteraction(
+      ctx,
+      assignInteraction(
+        [
+          { name: "title", value: "Do Z" },
+          { name: "agent", value: "Nobody" },
+        ],
+        "ch-1",
+      ),
+      defaultCmdCtx,
+    )) as any;
+    expect(result.data.content).toContain("Agent not found");
+    expect(mockPaperclipFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("/clip assign autocomplete", () => {
+  it("returns agent choices for the agent option", async () => {
+    const ctx = makeCtx({
+      agents: { list: vi.fn().mockResolvedValue([{ id: "a1", name: "CEO", role: "ceo" }, { id: "a2", name: "CTO", role: "cto" }]) },
+    });
+    const result = (await handleInteraction(
+      ctx,
+      {
+        type: 4,
+        data: {
+          name: "clip",
+          options: [{ name: "assign", options: [{ name: "agent", value: "ct", focused: true }] }],
+        },
+      },
+      defaultCmdCtx,
+    )) as any;
+    expect(result.type).toBe(8);
+    expect(result.data.choices).toEqual([{ name: "CTO", value: "CTO" }]);
+  });
+});
+
 describe("SLASH_COMMANDS", () => {
   it("defines clip and acp commands", () => {
     expect(SLASH_COMMANDS).toHaveLength(2);
     const clip = SLASH_COMMANDS[0]!;
     expect(clip.name).toBe("clip");
     const subNames = clip.options.map((o) => o.name);
-    expect(subNames).toEqual(["status", "approve", "budget", "issues", "agents", "companies", "projects", "help", "connect", "connect-channel", "digest", "commands"]);
+    expect(subNames).toEqual(["status", "approve", "budget", "issues", "assign", "agents", "companies", "projects", "help", "connect", "connect-channel", "digest", "commands"]);
 
     const acp = SLASH_COMMANDS[1]!;
     expect(acp.name).toBe("acp");
