@@ -3,6 +3,7 @@ import {
   formatIssueCreated,
   formatIssueDone,
   formatIssueBlocked,
+  formatBoardInputRequested,
   formatApprovalCreated,
   formatAgentError,
   formatSessionFailure,
@@ -163,6 +164,64 @@ describe("formatIssueBlocked", () => {
   it("includes a View Issue button when base URL is provided", () => {
     const msg = formatIssueBlocked(
       makeEvent({ entityId: "iss-9" }),
+      "https://app.paperclip.dev",
+    );
+    const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");
+    expect(viewBtn?.url).toBe("https://app.paperclip.dev/issues/iss-9");
+  });
+});
+
+describe("formatBoardInputRequested", () => {
+  it("uses purple color and an input-needed headline", () => {
+    const msg = formatBoardInputRequested(
+      makeEvent({ payload: { identifier: "PROJ-42", title: "Ship the thing", interactionKind: "request_confirmation" } }),
+    );
+    expect(msg.embeds?.[0]?.color).toBe(COLORS.PURPLE);
+    expect(msg.embeds?.[0]?.title).toBe("🗳️ Input needed: PROJ-42");
+    expect(msg.embeds?.[0]?.description).toBe("**Ship the thing** is waiting on your input.");
+  });
+
+  it("labels the request by interaction kind", () => {
+    const cases: Array<[string, string]> = [
+      ["request_confirmation", "Confirmation requested"],
+      ["request_checkbox_confirmation", "Confirmation requested"],
+      ["ask_user_questions", "Questions for you"],
+      ["suggest_tasks", "Proposed tasks to review"],
+    ];
+    for (const [kind, label] of cases) {
+      const msg = formatBoardInputRequested(
+        makeEvent({ payload: { identifier: "PROJ-42", interactionKind: kind } }),
+      );
+      const req = msg.embeds?.[0]?.fields?.find((f) => f.name === "Request");
+      expect(req?.value).toBe(label);
+    }
+  });
+
+  it("appends the interaction title/summary when present", () => {
+    const msg = formatBoardInputRequested(
+      makeEvent({
+        payload: {
+          identifier: "PROJ-42",
+          interactionKind: "suggest_tasks",
+          interactionTitle: "Two follow-up tasks",
+        },
+      }),
+    );
+    const req = msg.embeds?.[0]?.fields?.find((f) => f.name === "Request");
+    expect(req?.value).toBe("Proposed tasks to review — Two follow-up tasks");
+  });
+
+  it("falls back to a generic label for an unknown kind", () => {
+    const msg = formatBoardInputRequested(
+      makeEvent({ payload: { identifier: "PROJ-42", interactionKind: "something_else" } }),
+    );
+    const req = msg.embeds?.[0]?.fields?.find((f) => f.name === "Request");
+    expect(req?.value).toBe("Board input requested");
+  });
+
+  it("includes a View Issue button when base URL is provided", () => {
+    const msg = formatBoardInputRequested(
+      makeEvent({ entityId: "iss-9", payload: { interactionKind: "request_confirmation" } }),
       "https://app.paperclip.dev",
     );
     const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");

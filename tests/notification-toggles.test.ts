@@ -158,12 +158,27 @@ describe("notification toggles gate event registration", () => {
     expect(eventHandlers.has("issue.updated")).toBe(false);
   });
 
+  it("registers issue.interaction.created when the board-input toggle is on", async () => {
+    const { eventHandlers } = await runSetup({
+      notifyOnBoardInputRequested: true,
+    });
+    expect(eventHandlers.has("issue.interaction.created")).toBe(true);
+  });
+
+  it("does NOT register issue.interaction.created when the board-input toggle is off", async () => {
+    const { eventHandlers } = await runSetup({
+      notifyOnBoardInputRequested: false,
+    });
+    expect(eventHandlers.has("issue.interaction.created")).toBe(false);
+  });
+
   it("defaults keep run lifecycle noise off but in-review + done on", () => {
     expect(DEFAULT_CONFIG.notifyOnRunStarted).toBe(false);
     expect(DEFAULT_CONFIG.notifyOnRunFinished).toBe(false);
     expect(DEFAULT_CONFIG.notifyOnIssueInReview).toBe(true);
     expect(DEFAULT_CONFIG.notifyOnIssueDone).toBe(true);
     expect(DEFAULT_CONFIG.notifyOnIssueBlocked).toBe(true);
+    expect(DEFAULT_CONFIG.notifyOnBoardInputRequested).toBe(true);
   });
 });
 

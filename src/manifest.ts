@@ -147,6 +147,13 @@ const manifest: PaperclipPluginManifestV1 = {
           "High-frequency, low-signal. Leave off unless you want a message every time an agent finishes a run.",
         default: DEFAULT_CONFIG.notifyOnRunFinished,
       },
+      notifyOnBoardInputRequested: {
+        type: "boolean",
+        title: "Notify when a task needs your input",
+        description:
+          "Post a Discord message when an agent asks the board to decide — a confirmation card, a question, or proposed tasks to review — so you know a task is waiting on you.",
+        default: DEFAULT_CONFIG.notifyOnBoardInputRequested,
+      },
       notifyOnApprovalCreated: {
         type: "boolean",
         title: "Notify on approval requested",
