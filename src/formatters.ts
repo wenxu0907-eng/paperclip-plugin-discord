@@ -252,6 +252,61 @@ export function formatIssueInReview(event: PluginEvent, baseUrl?: string): Disco
   };
 }
 
+export function formatIssueBlocked(event: PluginEvent, baseUrl?: string): DiscordMessage {
+  const p = event.payload as Payload;
+  const identifier = String(p.identifier ?? p.title ?? event.entityId);
+  const title = String(p.title ?? "") || identifier;
+  const priority = p.priority ? String(p.priority) : null;
+  const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
+  const assigneeUserId = p.assigneeUserId ? String(p.assigneeUserId) : null;
+  const executorName = p.executorName ? String(p.executorName) : null;
+  const agentName = p.agentName ? String(p.agentName) : null;
+  const assigneeAgentId = p.assigneeAgentId ? String(p.assigneeAgentId) : null;
+  const assignedTo = humanizeActorLabel(
+    assigneeName || executorName || agentName || assigneeUserId || assigneeAgentId,
+  ) || "Unassigned";
+  const blockerReason = p.blockerReason ? String(p.blockerReason) : null;
+  const lastComment = p.lastComment ? String(p.lastComment) : null;
+  const reason = blockerReason
+    ? truncateForField(blockerReason)
+    : lastComment
+      ? truncateForField(lastComment)
+      : "No blocker reason provided";
+  const parentIdentifier = p.parentIdentifier ? String(p.parentIdentifier) : null;
+  const parentTitle = p.parentTitle ? String(p.parentTitle) : null;
+
+  const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
+  fields.push({ name: "Assigned to", value: assignedTo, inline: true });
+  if (priority) fields.push({ name: "Priority", value: `\`${humanizePriority(priority)}\``, inline: true });
+  fields.push({ name: "Blocker", value: reason });
+  if (parentIdentifier) {
+    const parentLine = parentTitle
+      ? `**${parentIdentifier}** — ${parentTitle}`
+      : `**${parentIdentifier}**`;
+    fields.push({ name: "Parent", value: parentLine, inline: true });
+  }
+
+  const base = resolveBaseUrl(baseUrl);
+  const buttons: DiscordComponent[] = [];
+  if (base) {
+    buttons.push({ type: 2, style: 5, label: "View Issue", url: `${base}/issues/${event.entityId}` });
+  }
+
+  return {
+    embeds: [
+      {
+        title: `🚫 Blocked: ${identifier}`,
+        description: `**${title}** is blocked and needs attention.`,
+        color: COLORS.RED,
+        fields,
+        footer: { text: "Paperclip" },
+        timestamp: event.occurredAt,
+      },
+    ],
+    components: buttons.length > 0 ? [{ type: 1, components: buttons }] : [],
+  };
+}
+
 function humanizeActorLabel(value: string | null): string | null {
   if (!value) return null;
   const trimmed = value.trim();

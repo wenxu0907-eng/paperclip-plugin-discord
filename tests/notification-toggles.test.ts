@@ -140,10 +140,20 @@ describe("notification toggles gate event registration", () => {
     expect(eventHandlers.has("issue.updated")).toBe(true);
   });
 
-  it("does NOT register issue.updated when both issue-status toggles are off", async () => {
+  it("registers issue.updated when only the blocked toggle is on", async () => {
     const { eventHandlers } = await runSetup({
       notifyOnIssueInReview: false,
       notifyOnIssueDone: false,
+      notifyOnIssueBlocked: true,
+    });
+    expect(eventHandlers.has("issue.updated")).toBe(true);
+  });
+
+  it("does NOT register issue.updated when all issue-status toggles are off", async () => {
+    const { eventHandlers } = await runSetup({
+      notifyOnIssueInReview: false,
+      notifyOnIssueDone: false,
+      notifyOnIssueBlocked: false,
     });
     expect(eventHandlers.has("issue.updated")).toBe(false);
   });
@@ -153,6 +163,7 @@ describe("notification toggles gate event registration", () => {
     expect(DEFAULT_CONFIG.notifyOnRunFinished).toBe(false);
     expect(DEFAULT_CONFIG.notifyOnIssueInReview).toBe(true);
     expect(DEFAULT_CONFIG.notifyOnIssueDone).toBe(true);
+    expect(DEFAULT_CONFIG.notifyOnIssueBlocked).toBe(true);
   });
 });
 

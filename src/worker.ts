@@ -21,6 +21,7 @@ import {
   formatIssueCreated,
   formatIssueInReview,
   formatIssueDone,
+  formatIssueBlocked,
   formatApprovalCreated,
   formatAgentError,
   formatSessionFailure,
@@ -73,6 +74,7 @@ type DiscordConfig = {
   notifyOnIssueCreated: boolean;
   notifyOnIssueInReview: boolean;
   notifyOnIssueDone: boolean;
+  notifyOnIssueBlocked: boolean;
   notifyOnApprovalCreated: boolean;
   notifyOnAgentError: boolean;
   notifyOnRunStarted: boolean;
@@ -309,6 +311,7 @@ async function enrichIssueNotificationPayload(
       executionAgentNameKey?: string | null;
       completedAt?: Date | string | null;
       updatedAt?: Date | string | null;
+      blockerReason?: string | null;
       project?: { name?: string | null } | null;
     } | null;
 
@@ -331,6 +334,7 @@ async function enrichIssueNotificationPayload(
       }
       if (payload.completedAt == null && issue.completedAt) payload.completedAt = String(issue.completedAt);
       if (payload.updatedAt == null && issue.updatedAt) payload.updatedAt = String(issue.updatedAt);
+      if (payload.blockerReason == null && issue.blockerReason) payload.blockerReason = issue.blockerReason;
       if (payload.projectName == null && issue.project?.name) payload.projectName = issue.project.name;
     }
 
@@ -338,7 +342,7 @@ async function enrichIssueNotificationPayload(
     // The review and done cards both surface the agent's latest message as the summary,
     // so enrich lastComment for either status (previously done-only, which left the
     // "Ready for Review" card with only the thin static fallback string).
-    if (notifyStatus === "done" || notifyStatus === "in_review") {
+    if (notifyStatus === "done" || notifyStatus === "in_review" || notifyStatus === "blocked") {
       const comments = await ctx.issues.listComments(event.entityId, companyId) as Array<{
         authorAgentId?: string | null;
         authorUserId?: string | null;
@@ -807,13 +811,38 @@ const plugin = definePlugin({
       });
     }
 
-    // A single issue.updated handler covers both the "in review" and "done"
-    // transitions. Each branch is independently gated by its own toggle so the
-    // board can subscribe to review-ready issues, completed issues, or both.
-    if (config.notifyOnIssueInReview || config.notifyOnIssueDone) {
+    // A single issue.updated handler covers the "in review", "done" and
+    // "blocked" transitions. Each branch is independently gated by its own
+    // toggle so the board can subscribe to review-ready issues, completed
+    // issues, blocked issues, or any combination.
+    if (config.notifyOnIssueInReview || config.notifyOnIssueDone || config.notifyOnIssueBlocked) {
       ctx.events.on("issue.updated", async (event: PluginEvent) => {
         const payload = await enrichIssueNotificationPayload(ctx, event);
         const status = payload.status;
+
+        if (status === "blocked") {
+          if (!config.notifyOnIssueBlocked) return;
+
+          // De-dupe repeated blocked updates keyed on the latest activity
+          // marker so an issue that receives several edits while blocked only
+          // pings once per transition into blocked.
+          const blockedMarker = String(payload.updatedAt ?? payload.lastActivityAt ?? payload.blockerReason ?? "");
+          if (blockedMarker) {
+            const stateKey = `issue_blocked_notified_${event.entityId}`;
+            const previousMarker = await ctx.state.get({
+              scopeKind: "instance",
+              stateKey,
+            }) as string | null;
+            if (previousMarker === blockedMarker) {
+              ctx.logger.debug(`Skipping duplicate blocked notification for ${event.entityId}`);
+              return;
+            }
+            await ctx.state.set({ scopeKind: "instance", stateKey }, blockedMarker);
+          }
+
+          await notify({ ...event, payload }, formatIssueBlocked);
+          return;
+        }
 
         if (status === "in_review") {
           if (!config.notifyOnIssueInReview) return;
