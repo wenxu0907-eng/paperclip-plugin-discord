@@ -113,6 +113,57 @@ export const SLASH_COMMANDS = [
         ],
       },
       {
+        name: "assign",
+        description: "Create a Paperclip issue (assign work) from this channel",
+        type: 1,
+        options: [
+          {
+            name: "title",
+            description: "Short title for the work",
+            type: 3,
+            required: true,
+          },
+          {
+            name: "details",
+            description: "Longer description / context",
+            type: 3,
+            required: false,
+          },
+          {
+            name: "company",
+            description: "Target company (defaults to this Discord's linked company)",
+            type: 3,
+            required: false,
+            autocomplete: true,
+          },
+          {
+            name: "project",
+            description: "Project name (defaults to this channel's mapped project)",
+            type: 3,
+            required: false,
+            autocomplete: true,
+          },
+          {
+            name: "agent",
+            description: "Assign to this agent (default: unassigned → auto-routing)",
+            type: 3,
+            required: false,
+            autocomplete: true,
+          },
+          {
+            name: "priority",
+            description: "Issue priority (default medium)",
+            type: 3,
+            required: false,
+            choices: [
+              { name: "low", value: "low" },
+              { name: "medium", value: "medium" },
+              { name: "high", value: "high" },
+            ],
+          },
+        ],
+      },
+      {
         name: "agents",
         description: "Show all agents with status indicators",
         type: 1,
@@ -420,6 +471,20 @@ async function handleSlashCommand(
       return handleBudget(ctx, getOption(subcommand.options ?? [], "agent"), companyId);
     case "issues":
       return handleIssues(ctx, companyId, getOption(subcommand.options ?? [], "project"), baseUrl);
+    case "assign":
+      return handleAssign(ctx, {
+        companyId,
+        baseUrl,
+        apiKey: cmdCtx?.paperclipBoardApiKey,
+        channelId: interactionChannelId,
+        actor: member?.user.username,
+        title: getOption(subcommand.options ?? [], "title"),
+        details: getOption(subcommand.options ?? [], "details"),
+        company: getOption(subcommand.options ?? [], "company"),
+        project: getOption(subcommand.options ?? [], "project"),
+        agent: getOption(subcommand.options ?? [], "agent"),
+        priority: getOption(subcommand.options ?? [], "priority"),
+      });
     case "agents":
       return handleAgents(ctx, companyId, getOption(subcommand.options ?? [], "company"), cmdCtx?.baseUrl);
     case "companies":
@@ -499,6 +564,29 @@ async function handleAutocomplete(
           choices: filtered.map((p) => ({
             name: p.name ?? p.id,
             value: p.name ?? p.id,
+          })),
+        },
+      };
+    }
+
+    if (focusedOption.name === "agent") {
+      const companyId = cmdCtx?.pluginCtx
+        ? await resolveCompanyId(cmdCtx.pluginCtx)
+        : (cmdCtx?.companyId ?? "default");
+      const agents = await ctx.agents.list({ companyId });
+      const filtered = agents
+        .filter((a: { id: string; name?: string | null; role?: string | null }) => {
+          const name = (a.name ?? a.id).toLowerCase();
+          const role = (a.role ?? "").toLowerCase();
+          return !query || name.includes(query) || role.includes(query);
+        })
+        .slice(0, 25);
+      return {
+        type: 8,
+        data: {
+          choices: filtered.map((a: { id: string; name?: string | null }) => ({
+            name: a.name ?? a.id,
+            value: a.name ?? a.id,
           })),
         },
       };
@@ -927,12 +1015,229 @@ async function handleProjects(
   }
 }
 
+// COM-45 Phase 1 (restored on fork source, COM-154): create (assign) a Paperclip
+// issue from Discord. Board decisions: authz = members of a channel connected via
+// `/clip connect-channel`; unmapped channels are rejected (no inbox fallback);
+// created issues are unassigned by default so normal Paperclip routing/triage
+// picks them up (no auto-invoke) unless an explicit `agent:` is given.
+async function handleAssign(
+  ctx: PluginContext,
+  opts: {
+    companyId: string;
+    baseUrl: string;
+    apiKey?: string;
+    channelId?: string;
+    actor?: string;
+    title?: string;
+    details?: string;
+    company?: string;
+    project?: string;
+    agent?: string;
+    priority?: string;
+  },
+): Promise<unknown> {
+  const { apiKey, channelId, actor } = opts;
+  const base = opts.baseUrl ?? "http://localhost:3100";
+  let effectiveCompanyId = opts.companyId;
+  let effectiveCompanyName: string | undefined;
+
+  const title = (opts.title ?? "").trim();
+  const details = (opts.details ?? "").trim();
+  const priority = ["low", "medium", "high"].includes(opts.priority ?? "")
+    ? (opts.priority as string)
+    : "medium";
+
+  if (!title) {
+    return respondToInteraction({
+      type: 4,
+      content: "Missing title. Usage: `/clip assign title:<what to do>`",
+      ephemeral: true,
+    });
+  }
+  if (!channelId) {
+    return respondToInteraction({
+      type: 4,
+      content: "Could not determine the current channel. Run this in the channel mapped to your project.",
+      ephemeral: true,
+    });
+  }
+
+  // Optional `company:` override — assign into a company other than this
+  // Discord's linked default (answers "what if I need another company?").
+  const companyOverride = (opts.company ?? "").trim();
+  if (companyOverride) {
+    try {
+      const companies = await ctx.companies.list();
+      const q = companyOverride.toLowerCase();
+      const c =
+        companies.find(
+          (x: { id: string; name?: string }) =>
+            (x.name ?? "").toLowerCase() === q || x.id === companyOverride,
+        ) ??
+        companies.find((x: { id: string; name?: string }) => (x.name ?? "").toLowerCase().includes(q));
+      if (!c) {
+        return respondToInteraction({
+          type: 4,
+          content: `Company not found: **${companyOverride}**. Check \`/clip companies\`.`,
+          ephemeral: true,
+        });
+      }
+      effectiveCompanyId = c.id;
+      effectiveCompanyName = c.name ?? c.id;
+    } catch (error) {
+      return respondToInteraction({
+        type: 4,
+        content: `Failed to look up companies: ${error instanceof Error ? error.message : String(error)}`,
+        ephemeral: true,
+      });
+    }
+  }
+
+  // Authz + routing gate: this channel must be connected to a project.
+  let channelMap: Record<string, string> = {};
+  try {
+    channelMap =
+      ((await ctx.state.get({ scopeKind: "instance", stateKey: "channel-project-map" })) as
+        | Record<string, string>
+        | null) ?? {};
+  } catch {
+    channelMap = {};
+  }
+  const mappedProjectNames = Object.keys(channelMap).filter((name) => channelMap[name] === channelId);
+  if (mappedProjectNames.length === 0) {
+    return respondToInteraction({
+      type: 4,
+      content:
+        "This channel isn't connected to a Paperclip project. A board member must run `/clip connect-channel project:<name>` here first.",
+      ephemeral: true,
+    });
+  }
+
+  // Resolve target project: explicit option (must belong to this company) or the channel's mapped project.
+  const requestedProjectName = (opts.project ?? "").trim() || mappedProjectNames[0];
+  let project: { id: string; name?: string } | undefined;
+  try {
+    const projects = (await ctx.projects.list({ companyId: effectiveCompanyId, limit: 100 })) as Array<{
+      id: string;
+      name?: string;
+    }>;
+    project = projects.find(
+      (p) => (p.name ?? "").toLowerCase() === requestedProjectName.toLowerCase() || p.id === requestedProjectName,
+    );
+  } catch (error) {
+    return respondToInteraction({
+      type: 4,
+      content: `Failed to look up projects: ${error instanceof Error ? error.message : String(error)}`,
+      ephemeral: true,
+    });
+  }
+  if (!project) {
+    return respondToInteraction({
+      type: 4,
+      content: `Project not found: **${requestedProjectName}**. Check \`/clip projects\` or the channel mapping.`,
+      ephemeral: true,
+    });
+  }
+
+  // Optional assignee: `agent:` option → assign directly; else unassigned (routing).
+  const agentQuery = (opts.agent ?? "").trim();
+  let assigneeAgentId: string | undefined;
+  let assigneeName: string | undefined;
+  if (agentQuery) {
+    try {
+      const agents = await ctx.agents.list({ companyId: effectiveCompanyId });
+      const q = agentQuery.toLowerCase();
+      const a =
+        agents.find(
+          (x: { id: string; name?: string | null; role?: string | null }) =>
+            (x.name ?? "").toLowerCase() === q || x.id === agentQuery || (x.role ?? "").toLowerCase() === q,
+        ) ??
+        agents.find(
+          (x: { id: string; name?: string | null; role?: string | null }) =>
+            (x.name ?? "").toLowerCase().includes(q) || (x.role ?? "").toLowerCase().includes(q),
+        );
+      if (!a) {
+        return respondToInteraction({
+          type: 4,
+          content: `Agent not found: **${agentQuery}**. Omit \`agent:\` to leave it for routing, or check \`/clip agents\`.`,
+          ephemeral: true,
+        });
+      }
+      assigneeAgentId = a.id;
+      assigneeName = a.name ?? a.id;
+    } catch (error) {
+      return respondToInteraction({
+        type: 4,
+        content: `Failed to look up agents: ${error instanceof Error ? error.message : String(error)}`,
+        ephemeral: true,
+      });
+    }
+  }
+
+  try {
+    const originNote = `Created via Discord by ${actor ?? "a Discord user"}${channelId ? ` in channel ${channelId}` : ""}.`;
+    const description = details ? `${details}\n\n_${originNote}_` : `_${originNote}_`;
+    const resp = await withRetry(async () => {
+      const createBody: Record<string, unknown> = { projectId: project!.id, title, description, priority };
+      if (assigneeAgentId) createBody.assigneeAgentId = assigneeAgentId;
+      const r = await paperclipFetch(
+        `${base}/api/companies/${effectiveCompanyId}/issues`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(createBody),
+        },
+        apiKey,
+      );
+      throwOnRetryableStatus(r);
+      return r;
+    });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      throw new Error(`API ${resp.status}: ${body}`);
+    }
+    const issue = (await resp.json().catch(() => ({}))) as { identifier?: string; id?: string };
+    const key = issue.identifier ?? issue.id ?? "(new issue)";
+    ctx.logger.info("Issue assigned via Discord", {
+      key: String(key),
+      companyId: effectiveCompanyId,
+      projectId: project.id,
+      actor,
+    });
+    return respondToInteraction({
+      type: 4,
+      embeds: [
+        {
+          title: `Issue Created — ${key}`,
+          description: title,
+          color: COLORS.GREEN,
+          fields: [
+            { name: "Company", value: effectiveCompanyName ?? "(linked default)", inline: true },
+            { name: "Project", value: project.name ?? project.id, inline: true },
+            { name: "Priority", value: priority, inline: true },
+            { name: "Assignee", value: assigneeName ?? "unassigned (routing)", inline: true },
+          ],
+          footer: { text: "Paperclip" },
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    });
+  } catch (error) {
+    return respondToInteraction({
+      type: 4,
+      content: `Failed to create issue: ${error instanceof Error ? error.message : String(error)}`,
+      ephemeral: true,
+    });
+  }
+}
+
 function handleHelp(): unknown {
   const commands = [
     "`/clip status` — Show active agents and recent completions",
     "`/clip companies` — List available companies",
     "`/clip projects [company]` — List projects",
     "`/clip issues [project]` — List open issues",
+    "`/clip assign title:<...> [details] [company] [project] [agent] [priority]` — Create/assign an issue from this channel",
     "`/clip agents [company]` — Show all agents with status",
     "`/clip approve <id>` — Approve a pending approval",
     "`/clip budget <agent>` — Check agent budget",
