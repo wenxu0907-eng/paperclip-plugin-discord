@@ -22,6 +22,8 @@ import {
   formatIssueInReview,
   formatIssueDone,
   formatIssueBlocked,
+  formatBoardInputRequested,
+  BOARD_INPUT_INTERACTION_KINDS,
   formatApprovalCreated,
   formatAgentError,
   formatSessionFailure,
@@ -75,6 +77,7 @@ type DiscordConfig = {
   notifyOnIssueInReview: boolean;
   notifyOnIssueDone: boolean;
   notifyOnIssueBlocked: boolean;
+  notifyOnBoardInputRequested: boolean;
   notifyOnApprovalCreated: boolean;
   notifyOnAgentError: boolean;
   notifyOnRunStarted: boolean;
@@ -890,6 +893,41 @@ const plugin = definePlugin({
 
           await notify({ ...event, payload }, formatIssueDone);
         }
+      });
+    }
+
+    // Board-input requests: an agent created an issue-thread interaction that
+    // needs a human decision — a confirmation card, a question, or a set of
+    // proposed tasks. The server forwards these as `issue.interaction.created`.
+    if (config.notifyOnBoardInputRequested) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ctx.events.on("issue.interaction.created" as any, async (event: PluginEvent) => {
+        const raw = (event.payload ?? {}) as Record<string, unknown>;
+        const kind = String(raw.interactionKind ?? "");
+        const status = String(raw.interactionStatus ?? "pending");
+
+        // Only ping for board-facing decision kinds that are still awaiting a
+        // response. Anything already resolved (or a non-decision kind) is noise.
+        if (!(BOARD_INPUT_INTERACTION_KINDS as readonly string[]).includes(kind)) return;
+        if (status && status !== "pending") return;
+
+        // De-dupe per interaction so a retry of the same creation only pings once.
+        const interactionId = String(raw.interactionId ?? "");
+        if (interactionId) {
+          const stateKey = `issue_interaction_notified_${interactionId}`;
+          const previous = await ctx.state.get({
+            scopeKind: "instance",
+            stateKey,
+          }) as string | null;
+          if (previous) {
+            ctx.logger.debug(`Skipping duplicate board-input notification for ${interactionId}`);
+            return;
+          }
+          await ctx.state.set({ scopeKind: "instance", stateKey }, event.eventId || "1");
+        }
+
+        const payload = await enrichIssueNotificationPayload(ctx, event);
+        await notify({ ...event, payload }, formatBoardInputRequested);
       });
     }
 

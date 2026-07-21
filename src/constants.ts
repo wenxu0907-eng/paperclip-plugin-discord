@@ -25,6 +25,7 @@ export const DEFAULT_CONFIG = {
   notifyOnIssueInReview: true,
   notifyOnIssueDone: true,
   notifyOnIssueBlocked: true,
+  notifyOnBoardInputRequested: true,
   notifyOnApprovalCreated: true,
   notifyOnAgentError: true,
   // Agent run lifecycle events are high-frequency, low-signal. Default them

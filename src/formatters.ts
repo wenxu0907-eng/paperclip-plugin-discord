@@ -315,6 +315,74 @@ function humanizeActorLabel(value: string | null): string | null {
   return trimmed;
 }
 
+// Issue-thread interaction kinds that surface a board-facing decision — i.e. an
+// agent is waiting on a human to confirm, answer, or choose. Mirrors the server's
+// board-facing decision set. Other interaction kinds are ignored.
+export const BOARD_INPUT_INTERACTION_KINDS = [
+  "request_confirmation",
+  "request_checkbox_confirmation",
+  "ask_user_questions",
+  "suggest_tasks",
+] as const;
+
+const BOARD_INPUT_KIND_LABELS: Record<string, string> = {
+  request_confirmation: "Confirmation requested",
+  request_checkbox_confirmation: "Confirmation requested",
+  ask_user_questions: "Questions for you",
+  suggest_tasks: "Proposed tasks to review",
+};
+
+/**
+ * Card for `issue.interaction.created`: an agent opened a board-facing interaction
+ * (confirmation card, questions, or proposed tasks) and is waiting on the board.
+ */
+export function formatBoardInputRequested(event: PluginEvent, baseUrl?: string): DiscordMessage {
+  const p = event.payload as Payload;
+  const identifier = String(p.identifier ?? p.title ?? event.entityId);
+  const title = String(p.title ?? "") || identifier;
+  const priority = p.priority ? String(p.priority) : null;
+  const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
+  const assigneeUserId = p.assigneeUserId ? String(p.assigneeUserId) : null;
+  const executorName = p.executorName ? String(p.executorName) : null;
+  const agentName = p.agentName ? String(p.agentName) : null;
+  const assigneeAgentId = p.assigneeAgentId ? String(p.assigneeAgentId) : null;
+  const assignedTo = humanizeActorLabel(
+    assigneeName || executorName || agentName || assigneeUserId || assigneeAgentId,
+  ) || "Unassigned";
+
+  const kind = String(p.interactionKind ?? "");
+  const requestLabel = BOARD_INPUT_KIND_LABELS[kind] ?? "Board input requested";
+  const interactionTitle = p.interactionTitle ? String(p.interactionTitle) : null;
+  const interactionSummary = p.interactionSummary ? String(p.interactionSummary) : null;
+  const detail = interactionTitle || interactionSummary;
+  const requestValue = detail ? `${requestLabel} — ${truncateForField(detail)}` : requestLabel;
+
+  const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
+  fields.push({ name: "Assigned to", value: assignedTo, inline: true });
+  if (priority) fields.push({ name: "Priority", value: `\`${humanizePriority(priority)}\``, inline: true });
+  fields.push({ name: "Request", value: requestValue });
+
+  const base = resolveBaseUrl(baseUrl);
+  const buttons: DiscordComponent[] = [];
+  if (base) {
+    buttons.push({ type: 2, style: 5, label: "View Issue", url: `${base}/issues/${event.entityId}` });
+  }
+
+  return {
+    embeds: [
+      {
+        title: `🗳️ Input needed: ${identifier}`,
+        description: `**${title}** is waiting on your input.`,
+        color: COLORS.PURPLE,
+        fields,
+        footer: { text: "Paperclip" },
+        timestamp: event.occurredAt,
+      },
+    ],
+    components: buttons.length > 0 ? [{ type: 1, components: buttons }] : [],
+  };
+}
+
 export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
   const approvalType = String(p.type ?? "unknown");
