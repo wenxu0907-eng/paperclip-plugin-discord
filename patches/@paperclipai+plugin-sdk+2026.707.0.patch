@@ -1,0 +1,26 @@
+diff --git a/node_modules/@paperclipai/plugin-sdk/dist/worker-rpc-host.js b/node_modules/@paperclipai/plugin-sdk/dist/worker-rpc-host.js
+index 646b198..8d1722f 100644
+--- a/node_modules/@paperclipai/plugin-sdk/dist/worker-rpc-host.js
++++ b/node_modules/@paperclipai/plugin-sdk/dist/worker-rpc-host.js
+@@ -229,8 +229,8 @@ export function startWorkerRpcHost(options) {
+                 return manifest;
+             },
+             config: {
+-                async get() {
+-                    return callHost("config.get", {});
++                async get(params) {
++                    return callHost("config.get", params ?? {});
+                 },
+             },
+             localFolders: {
+@@ -368,8 +368,8 @@ export function startWorkerRpcHost(options) {
+                 },
+             },
+             secrets: {
+-                async resolve(secretRef) {
+-                    return callHost("secrets.resolve", { secretRef });
++                async resolve(secretRef, options) {
++                    return callHost("secrets.resolve", { secretRef, ...options });
+                 },
+             },
+             activity: {
