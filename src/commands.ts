@@ -5,7 +5,7 @@ import { humanizeStatus } from "./formatters.js";
 import { withRetry, throwOnRetryableStatus } from "./retry.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
-import { resolveCompanyId } from "./company-resolver.js";
+import { resolveCompanyId, resolveCompanyIdForChannel } from "./company-resolver.js";
 import { getEscalation } from "./escalation-state.js";
 import {
   type Workflow,
@@ -400,7 +400,7 @@ export async function handleInteraction(
   }
 
   if (interaction.type === 4 && interaction.data) {
-    return handleAutocomplete(ctx, interaction.data, cmdCtx);
+    return handleAutocomplete(ctx, interaction.data, cmdCtx, interaction.channel_id);
   }
 
   return respondToInteraction({
@@ -417,9 +417,11 @@ async function handleSlashCommand(
   cmdCtx?: CommandContext,
   interactionChannelId?: string,
 ): Promise<unknown> {
-  // Lazy company-ID resolution: resolve on first command, not at startup.
+  // Company-ID resolution: prefer the company that owns the channel the
+  // interaction came from — a single worker serves every company's channels, so
+  // a shared instance default would misattribute the command to one company.
   const companyId = cmdCtx?.pluginCtx
-    ? await resolveCompanyId(cmdCtx.pluginCtx)
+    ? await resolveCompanyIdForChannel(cmdCtx.pluginCtx, interactionChannelId)
     : (cmdCtx?.companyId ?? "default");
 
   if (data.name === "acp") {
@@ -518,6 +520,7 @@ async function handleAutocomplete(
   ctx: PluginContext,
   data: InteractionData,
   cmdCtx?: CommandContext,
+  interactionChannelId?: string,
 ): Promise<unknown> {
   const subcommand = data.options?.[0];
   if (!subcommand) return { type: 8, data: { choices: [] } };
@@ -549,7 +552,7 @@ async function handleAutocomplete(
 
     if (focusedOption.name === "project") {
       const companyId = cmdCtx?.pluginCtx
-        ? await resolveCompanyId(cmdCtx.pluginCtx)
+        ? await resolveCompanyIdForChannel(cmdCtx.pluginCtx, interactionChannelId)
         : (cmdCtx?.companyId ?? "default");
       const projects = await ctx.projects.list({ companyId, limit: 100 });
       const filtered = projects
@@ -571,7 +574,7 @@ async function handleAutocomplete(
 
     if (focusedOption.name === "agent") {
       const companyId = cmdCtx?.pluginCtx
-        ? await resolveCompanyId(cmdCtx.pluginCtx)
+        ? await resolveCompanyIdForChannel(cmdCtx.pluginCtx, interactionChannelId)
         : (cmdCtx?.companyId ?? "default");
       const agents = await ctx.agents.list({ companyId });
       const filtered = agents
