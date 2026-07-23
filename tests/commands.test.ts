@@ -32,6 +32,7 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
       list: vi.fn().mockResolvedValue([]),
       get: vi.fn().mockResolvedValue(null),
       update: vi.fn().mockResolvedValue({}),
+      create: vi.fn().mockResolvedValue({ id: "iss-new", identifier: "ONB-42" }),
     },
     companies: {
       list: vi.fn().mockResolvedValue([]),
@@ -1070,14 +1071,6 @@ describe("autocomplete (interaction type 4)", () => {
 });
 
 describe("/clip assign", () => {
-  const okCreate = (identifier = "ONB-42") => ({
-    ok: true,
-    status: 200,
-    headers: new Headers(),
-    text: () => Promise.resolve(""),
-    json: () => Promise.resolve({ identifier, id: "iss-1" }),
-  });
-
   function assignInteraction(
     options: Array<{ name: string; value?: string | number }>,
     channelId?: string,
@@ -1112,36 +1105,37 @@ describe("/clip assign", () => {
   });
 
   it("creates an unassigned issue in the channel's mapped project", async () => {
-    mockPaperclipFetch.mockResolvedValue(okCreate("ONB-42"));
+    const create = vi.fn().mockResolvedValue({ id: "iss-42", identifier: "ONB-42" });
     const ctx = makeCtx({
       state: { get: vi.fn().mockResolvedValue({ Onboarding: "ch-1" }), set: vi.fn() },
       projects: { list: vi.fn().mockResolvedValue([{ id: "p1", name: "Onboarding" }]) },
+      issues: { list: vi.fn().mockResolvedValue([]), create },
     });
     const result = (await handleInteraction(
       ctx,
       assignInteraction([{ name: "title", value: "Do X" }], "ch-1"),
       defaultCmdCtx,
     )) as any;
-    expect(mockPaperclipFetch).toHaveBeenCalledWith(
-      "http://localhost:3100/api/companies/default/issues",
-      expect.objectContaining({ method: "POST" }),
-      expect.anything(),
-    );
-    const body = JSON.parse(mockPaperclipFetch.mock.calls[0][1].body);
-    expect(body.projectId).toBe("p1");
-    expect(body.title).toBe("Do X");
-    expect(body.priority).toBe("medium");
-    expect(body.assigneeAgentId).toBeUndefined();
+    // Create must go through the host-local SDK, not a raw fetch to the public base URL.
+    expect(mockPaperclipFetch).not.toHaveBeenCalled();
+    expect(create).toHaveBeenCalledTimes(1);
+    const input = create.mock.calls[0][0];
+    expect(input.companyId).toBe("default");
+    expect(input.projectId).toBe("p1");
+    expect(input.title).toBe("Do X");
+    expect(input.priority).toBe("medium");
+    expect(input.assigneeAgentId).toBeUndefined();
     expect(result.data.embeds[0].title).toContain("ONB-42");
     expect(result.data.embeds[0].fields.find((f: any) => f.name === "Assignee").value).toContain("unassigned");
   });
 
   it("assigns to a named agent and honors priority", async () => {
-    mockPaperclipFetch.mockResolvedValue(okCreate("ONB-43"));
+    const create = vi.fn().mockResolvedValue({ id: "iss-43", identifier: "ONB-43" });
     const ctx = makeCtx({
       state: { get: vi.fn().mockResolvedValue({ Onboarding: "ch-1" }), set: vi.fn() },
       projects: { list: vi.fn().mockResolvedValue([{ id: "p1", name: "Onboarding" }]) },
       agents: { list: vi.fn().mockResolvedValue([{ id: "a1", name: "CEO", role: "ceo" }]) },
+      issues: { list: vi.fn().mockResolvedValue([]), create },
     });
     const result = (await handleInteraction(
       ctx,
@@ -1155,9 +1149,10 @@ describe("/clip assign", () => {
       ),
       defaultCmdCtx,
     )) as any;
-    const body = JSON.parse(mockPaperclipFetch.mock.calls[0][1].body);
-    expect(body.assigneeAgentId).toBe("a1");
-    expect(body.priority).toBe("high");
+    expect(create).toHaveBeenCalledTimes(1);
+    const input = create.mock.calls[0][0];
+    expect(input.assigneeAgentId).toBe("a1");
+    expect(input.priority).toBe("high");
     expect(result.data.embeds[0].fields.find((f: any) => f.name === "Assignee").value).toBe("CEO");
   });
 

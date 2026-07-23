@@ -1039,8 +1039,7 @@ async function handleAssign(
     priority?: string;
   },
 ): Promise<unknown> {
-  const { apiKey, channelId, actor } = opts;
-  const base = opts.baseUrl ?? "http://localhost:3100";
+  const { channelId, actor } = opts;
   let effectiveCompanyId = opts.companyId;
   let effectiveCompanyName: string | undefined;
 
@@ -1180,40 +1179,37 @@ async function handleAssign(
   try {
     const originNote = `Created via Discord by ${actor ?? "a Discord user"}${channelId ? ` in channel ${channelId}` : ""}.`;
     const description = details ? `${details}\n\n_${originNote}_` : `_${originNote}_`;
-    const resp = await withRetry(async () => {
-      const createBody: Record<string, unknown> = { projectId: project!.id, title, description, priority };
-      if (assigneeAgentId) createBody.assigneeAgentId = assigneeAgentId;
-      const r = await paperclipFetch(
-        `${base}/api/companies/${effectiveCompanyId}/issues`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(createBody),
-        },
-        apiKey,
-      );
-      throwOnRetryableStatus(r);
-      return r;
-    });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => "");
-      throw new Error(`API ${resp.status}: ${body}`);
-    }
-    const issue = (await resp.json().catch(() => ({}))) as { identifier?: string; id?: string };
-    // A 2xx that carries neither an identifier nor an id is not a created issue —
-    // it usually means the request was answered by something other than the API
-    // create route (e.g. an access gate or SPA fallback at the base URL returning
-    // a 200 HTML page). Surface that as a failure instead of logging false success.
-    if (!issue.identifier && !issue.id) {
-      const raw = JSON.stringify(issue).slice(0, 200);
-      ctx.logger.warn("Assign create returned 2xx without an issue", {
+    // Create through the host-local SDK (ctx.issues.create) rather than a raw
+    // fetch to the public base URL. Every other operation in this handler
+    // (companies/projects/agents lookups) already goes through ctx.*, which
+    // resolves against the host in-process. The old path POSTed to
+    // `${base}/api/companies/{id}/issues` over the public Cloudflare tunnel,
+    // which answered 200 with an empty body (edge/SPA fallback) so the create
+    // silently no-op'd — "create returned 200 but no issue was returned"
+    // (COM-154). The SDK path has no network round-trip and returns the real
+    // created Issue.
+    const createInput: {
+      companyId: string;
+      projectId: string;
+      title: string;
+      description: string;
+      priority: "low" | "medium" | "high";
+      assigneeAgentId?: string;
+    } = {
+      companyId: effectiveCompanyId,
+      projectId: project!.id,
+      title,
+      description,
+      priority: priority as "low" | "medium" | "high",
+    };
+    if (assigneeAgentId) createInput.assigneeAgentId = assigneeAgentId;
+    const issue = (await ctx.issues.create(createInput)) as { identifier?: string; id?: string };
+    if (!issue || (!issue.identifier && !issue.id)) {
+      ctx.logger.warn("Assign create returned no issue", {
         companyId: effectiveCompanyId,
         projectId: project.id,
-        body: raw,
       });
-      throw new Error(
-        `create returned ${resp.status} but no issue was returned (base URL may not be reaching the API): ${raw}`,
-      );
+      throw new Error("create did not return an issue");
     }
     const key = issue.identifier ?? issue.id ?? "(new issue)";
     ctx.logger.info("Issue assigned via Discord", {
