@@ -1355,14 +1355,57 @@ async function handleConnectChannel(
     });
   }
 
+  const requested = projectName.trim();
+
   try {
+    // Resolve the company that owns this channel, then validate that a project
+    // with the requested name/id actually exists there. Without this check the
+    // raw name was stored blindly, and the mismatch stayed silent until a board
+    // member ran `/clip assign` and hit "Project not found" (COM-167 / COM-154).
+    const companyId = await resolveCompanyIdForChannel(ctx, channelId);
+    let projects: Array<{ id: string; name?: string }>;
+    try {
+      projects = (await ctx.projects.list({ companyId, limit: 100 })) as Array<{
+        id: string;
+        name?: string;
+      }>;
+    } catch (error) {
+      return respondToInteraction({
+        type: 4,
+        content: `Failed to look up projects: ${error instanceof Error ? error.message : String(error)}`,
+        ephemeral: true,
+      });
+    }
+
+    const match = projects.find(
+      (p) => (p.name ?? "").toLowerCase() === requested.toLowerCase() || p.id === requested,
+    );
+
+    if (!match) {
+      const list = projects.length
+        ? projects.map((p) => `\`${p.name ?? p.id}\``).join(", ")
+        : "(none — create a project in Paperclip first)";
+      return respondToInteraction({
+        type: 4,
+        content: `Project not found: **${requested}**. Valid projects: ${list}`,
+        ephemeral: true,
+      });
+    }
+
     const existing = (await ctx.state.get({
       scopeKind: "instance",
       stateKey: "channel-project-map",
     })) as Record<string, string> | null;
 
     const channelMap = existing ?? {};
-    channelMap[projectName.trim()] = channelId;
+    // Drop any prior keys pointing at this channel so a re-connect (or a name→id
+    // migration) doesn't leave stale duplicate mappings that drift on rename.
+    for (const key of Object.keys(channelMap)) {
+      if (channelMap[key] === channelId) delete channelMap[key];
+    }
+    // Store the resolved project **id** (not the raw name) so a later project
+    // rename can't re-break resolution; the assign path matches on id or name.
+    channelMap[match.id] = channelId;
 
     await ctx.state.set(
       { scopeKind: "instance", stateKey: "channel-project-map" },
@@ -1373,7 +1416,7 @@ async function handleConnectChannel(
       type: 4,
       embeds: [{
         title: "Channel Mapped",
-        description: `Mapped project **${projectName.trim()}** to this channel.`,
+        description: `Mapped project **${match.name ?? match.id}** to this channel.`,
         color: COLORS.GREEN,
         footer: { text: "Paperclip" },
         timestamp: new Date().toISOString(),

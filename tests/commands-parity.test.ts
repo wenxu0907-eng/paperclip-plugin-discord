@@ -279,8 +279,11 @@ describe("/clip connect", () => {
 // ---------------------------------------------------------------------------
 
 describe("/clip connect-channel", () => {
-  it("maps project to the interaction channel", async () => {
-    const ctx = makeCtx();
+  it("maps project to the interaction channel (stores resolved project id)", async () => {
+    const ctx = makeCtx({
+      companies: { list: vi.fn().mockResolvedValue([{ id: "company-1" }]) },
+      projects: { list: vi.fn().mockResolvedValue([{ id: "proj-my", name: "my-project" }]) },
+    });
     const result = (await handleInteraction(
       ctx,
       clipInteraction("connect-channel", [{ name: "project", value: "my-project" }], "ch-topic-123"),
@@ -289,9 +292,47 @@ describe("/clip connect-channel", () => {
 
     expect(result.data.embeds[0].title).toBe("Channel Mapped");
     expect(result.data.embeds[0].description).toContain("my-project");
+    // Stores the resolved project id, not the raw name, so a rename can't break it.
     expect(ctx.state.set).toHaveBeenCalledWith(
       expect.objectContaining({ stateKey: "channel-project-map" }),
-      expect.objectContaining({ "my-project": "ch-topic-123" }),
+      expect.objectContaining({ "proj-my": "ch-topic-123" }),
+    );
+  });
+
+  it("rejects a nonexistent project and lists valid ones", async () => {
+    const ctx = makeCtx({
+      companies: { list: vi.fn().mockResolvedValue([{ id: "company-1" }]) },
+      projects: { list: vi.fn().mockResolvedValue([{ id: "p1", name: "Onboarding" }]) },
+    });
+    const result = (await handleInteraction(
+      ctx,
+      clipInteraction("connect-channel", [{ name: "project", value: "EA" }], "ch-topic-123"),
+      defaultCmdCtx,
+    )) as any;
+
+    expect(result.data.content).toContain("Project not found");
+    expect(result.data.content).toContain("Onboarding");
+    expect(ctx.state.set).not.toHaveBeenCalled();
+  });
+
+  it("drops stale mappings for the same channel on re-connect", async () => {
+    const ctx = makeCtx({
+      companies: { list: vi.fn().mockResolvedValue([{ id: "company-1" }]) },
+      projects: { list: vi.fn().mockResolvedValue([{ id: "p-new", name: "New" }]) },
+      state: {
+        get: vi.fn().mockResolvedValue({ "old-name": "ch-topic-123", "other": "ch-999" }),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    await handleInteraction(
+      ctx,
+      clipInteraction("connect-channel", [{ name: "project", value: "New" }], "ch-topic-123"),
+      defaultCmdCtx,
+    );
+
+    expect(ctx.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "channel-project-map" }),
+      { "other": "ch-999", "p-new": "ch-topic-123" },
     );
   });
 
