@@ -31,6 +31,9 @@ interface InteractionCreateEvent {
   id: string;
   token: string;
   type: number;
+  // Discord's application (bot) id, needed to address the follow-up webhook
+  // when a slash command is deferred.
+  application_id?: string;
   data?: Record<string, unknown>;
   member?: { user: { username: string } };
   guild_id?: string;
@@ -84,6 +87,44 @@ export async function respondViaCallback(
     }
   } catch (error) {
     ctx.logger.error("Interaction callback error", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+// After a slash command is deferred (see the INTERACTION_CREATE handler), the
+// real response is delivered by editing the original (deferred) message via the
+// interaction follow-up webhook. The interaction token is valid for 15 minutes,
+// so the underlying work (resolve company/project/agent, create the issue) is no
+// longer racing Discord's hard 3-second callback deadline.
+export async function editDeferredResponse(
+  ctx: PluginContext,
+  applicationId: string,
+  interactionToken: string,
+  responseData: unknown,
+): Promise<void> {
+  // A handler builds an interaction *callback* payload — `{ type, data: {...} }`.
+  // The follow-up webhook takes the message body directly, so unwrap `.data`.
+  const message =
+    responseData && typeof responseData === "object" && "data" in responseData
+      ? (responseData as { data: unknown }).data
+      : responseData;
+  const url = `${DISCORD_API_BASE}/webhooks/${applicationId}/${interactionToken}/messages/@original`;
+  try {
+    const response = await fetch(url, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(message ?? {}),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      ctx.logger.warn("Interaction follow-up edit failed", {
+        status: response.status,
+        body: text,
+      });
+    }
+  } catch (error) {
+    ctx.logger.error("Interaction follow-up edit error", {
       error: error instanceof Error ? error.message : String(error),
     });
   }
@@ -225,8 +266,33 @@ export async function connectGateway(
           if (payload.t === "INTERACTION_CREATE") {
             const interaction = payload.d as InteractionCreateEvent;
             try {
-              const response = await onInteraction(interaction);
-              await respondViaCallback(ctx, interaction.id, interaction.token, response);
+              // Slash commands (type 2) can run work that easily exceeds
+              // Discord's hard 3-second callback deadline — e.g. `/clip assign`
+              // resolves the company, project, and agent and then creates the
+              // issue over the network. When that happens Discord invalidates
+              // the token (10062) and shows the user "The application did not
+              // respond" even though the work succeeded, and the real result
+              // never reaches them. Acknowledge immediately with a deferred
+              // response (type 5), then deliver the result by editing the
+              // deferred message. PING (type 1) must answer with type 1 and
+              // autocomplete (type 4) must answer with type 8 — neither is
+              // deferrable — so they keep the direct-callback path.
+              if (interaction.type === 2 && interaction.application_id) {
+                await respondViaCallback(ctx, interaction.id, interaction.token, {
+                  type: 5,
+                  data: { flags: 64 },
+                });
+                const response = await onInteraction(interaction);
+                await editDeferredResponse(
+                  ctx,
+                  interaction.application_id,
+                  interaction.token,
+                  response,
+                );
+              } else {
+                const response = await onInteraction(interaction);
+                await respondViaCallback(ctx, interaction.id, interaction.token, response);
+              }
             } catch (error) {
               ctx.logger.error("Gateway interaction handler error", {
                 error: error instanceof Error ? error.message : String(error),
