@@ -282,3 +282,62 @@ describe("respondViaCallback", () => {
     );
   });
 });
+
+describe("editDeferredResponse", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("PATCHes the @original follow-up webhook and unwraps the callback .data body", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(""),
+    }) as unknown as typeof fetch;
+
+    const { editDeferredResponse } = await import("../src/gateway.js");
+    const ctx = makeCtx();
+
+    // Handlers return an interaction *callback* payload (`{ type, data }`);
+    // the follow-up webhook wants the message body, so `.data` must be unwrapped.
+    await editDeferredResponse(ctx, "app-1", "token-1", {
+      type: 4,
+      data: { content: "Issue Created — COM-999", flags: 64 },
+    });
+
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/webhooks/app-1/token-1/messages/@original"),
+      expect.objectContaining({ method: "PATCH" }),
+    );
+    const [, init] = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse((init as { body: string }).body)).toEqual({
+      content: "Issue Created — COM-999",
+      flags: 64,
+    });
+    expect(ctx.logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("logs a warning when the follow-up edit fails", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      text: () => Promise.resolve("Unknown Webhook"),
+    }) as unknown as typeof fetch;
+
+    const { editDeferredResponse } = await import("../src/gateway.js");
+    const ctx = makeCtx();
+
+    await editDeferredResponse(ctx, "app-1", "token-1", { type: 4, data: {} });
+
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      "Interaction follow-up edit failed",
+      expect.objectContaining({ status: 404 }),
+    );
+  });
+});

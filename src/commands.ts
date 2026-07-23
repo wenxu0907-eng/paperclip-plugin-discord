@@ -1200,6 +1200,21 @@ async function handleAssign(
       throw new Error(`API ${resp.status}: ${body}`);
     }
     const issue = (await resp.json().catch(() => ({}))) as { identifier?: string; id?: string };
+    // A 2xx that carries neither an identifier nor an id is not a created issue —
+    // it usually means the request was answered by something other than the API
+    // create route (e.g. an access gate or SPA fallback at the base URL returning
+    // a 200 HTML page). Surface that as a failure instead of logging false success.
+    if (!issue.identifier && !issue.id) {
+      const raw = JSON.stringify(issue).slice(0, 200);
+      ctx.logger.warn("Assign create returned 2xx without an issue", {
+        companyId: effectiveCompanyId,
+        projectId: project.id,
+        body: raw,
+      });
+      throw new Error(
+        `create returned ${resp.status} but no issue was returned (base URL may not be reaching the API): ${raw}`,
+      );
+    }
     const key = issue.identifier ?? issue.id ?? "(new issue)";
     ctx.logger.info("Issue assigned via Discord", {
       key: String(key),
