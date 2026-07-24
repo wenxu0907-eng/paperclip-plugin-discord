@@ -1090,17 +1090,48 @@ describe("/clip assign", () => {
     expect(mockPaperclipFetch).not.toHaveBeenCalled();
   });
 
-  it("rejects when the channel is not connected to a project", async () => {
+  it("asks to disambiguate when the company has multiple projects and none resolve", async () => {
+    // The channel is linked to a company but has no channel→project mapping and
+    // no explicit project: option. With more than one project we cannot guess, so
+    // assign must ask the board to disambiguate instead of creating anything.
+    const create = vi.fn();
     const ctx = makeCtx({
       state: { get: vi.fn().mockResolvedValue({}), set: vi.fn() },
-      projects: { list: vi.fn().mockResolvedValue([{ id: "p1", name: "Onboarding" }]) },
+      projects: {
+        list: vi.fn().mockResolvedValue([
+          { id: "p1", name: "Onboarding" },
+          { id: "p2", name: "Growth" },
+        ]),
+      },
+      issues: { list: vi.fn().mockResolvedValue([]), create },
     });
     const result = (await handleInteraction(
       ctx,
       assignInteraction([{ name: "title", value: "Do X" }], "ch-1"),
       defaultCmdCtx,
     )) as any;
-    expect(result.data.content).toContain("isn't connected to a Paperclip project");
+    expect(result.data.content).toContain("multiple projects");
+    expect(create).not.toHaveBeenCalled();
+    expect(mockPaperclipFetch).not.toHaveBeenCalled();
+  });
+
+  it("auto-resolves the company's only project when the channel has no mapping", async () => {
+    // PR #11 core: a channel linked to a company with exactly one project should
+    // assign into that project without requiring a separate /clip connect-channel.
+    const create = vi.fn().mockResolvedValue({ id: "iss-77", identifier: "ONB-77" });
+    const ctx = makeCtx({
+      state: { get: vi.fn().mockResolvedValue({}), set: vi.fn() },
+      projects: { list: vi.fn().mockResolvedValue([{ id: "p1", name: "Onboarding" }]) },
+      issues: { list: vi.fn().mockResolvedValue([]), create },
+    });
+    const result = (await handleInteraction(
+      ctx,
+      assignInteraction([{ name: "title", value: "Do X" }], "ch-1"),
+      defaultCmdCtx,
+    )) as any;
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0].projectId).toBe("p1");
+    expect(result.data.embeds[0].title).toContain("ONB-77");
     expect(mockPaperclipFetch).not.toHaveBeenCalled();
   });
 

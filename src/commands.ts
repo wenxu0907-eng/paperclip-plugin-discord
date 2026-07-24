@@ -1095,7 +1095,13 @@ async function handleAssign(
     }
   }
 
-  // Authz + routing gate: this channel must be connected to a project.
+  // Resolve the target project. The channel is already linked to a company
+  // (this Discord instance's config), so we don't require a *separate*
+  // channel→project mapping. Precedence:
+  //   1. explicit `project:` option
+  //   2. this channel's `/clip connect-channel` mapping (if any)
+  //   3. the company's only project, when it has exactly one
+  // Only when none of these resolve do we ask the board to disambiguate.
   let channelMap: Record<string, string> = {};
   try {
     channelMap =
@@ -1106,26 +1112,13 @@ async function handleAssign(
     channelMap = {};
   }
   const mappedProjectNames = Object.keys(channelMap).filter((name) => channelMap[name] === channelId);
-  if (mappedProjectNames.length === 0) {
-    return respondToInteraction({
-      type: 4,
-      content:
-        "This channel isn't connected to a Paperclip project. A board member must run `/clip connect-channel project:<name>` here first.",
-      ephemeral: true,
-    });
-  }
 
-  // Resolve target project: explicit option (must belong to this company) or the channel's mapped project.
-  const requestedProjectName = (opts.project ?? "").trim() || mappedProjectNames[0];
-  let project: { id: string; name?: string } | undefined;
+  let projects: Array<{ id: string; name?: string }> = [];
   try {
-    const projects = (await ctx.projects.list({ companyId: effectiveCompanyId, limit: 100 })) as Array<{
+    projects = (await ctx.projects.list({ companyId: effectiveCompanyId, limit: 100 })) as Array<{
       id: string;
       name?: string;
     }>;
-    project = projects.find(
-      (p) => (p.name ?? "").toLowerCase() === requestedProjectName.toLowerCase() || p.id === requestedProjectName,
-    );
   } catch (error) {
     return respondToInteraction({
       type: 4,
@@ -1133,10 +1126,32 @@ async function handleAssign(
       ephemeral: true,
     });
   }
-  if (!project) {
+
+  const requestedProjectName =
+    (opts.project ?? "").trim() ||
+    mappedProjectNames[0] ||
+    (projects.length === 1 ? (projects[0].name ?? projects[0].id) : "");
+
+  if (!requestedProjectName) {
+    const names = projects.map((p) => `\`${p.name ?? p.id}\``).join(", ") || "(none)";
     return respondToInteraction({
       type: 4,
-      content: `Project not found: **${requestedProjectName}**. Check \`/clip projects\` or the channel mapping.`,
+      content:
+        `This company has multiple projects, so I can't tell which one to use. ` +
+        `Re-run with \`project:<name>\` (available: ${names}), or a board member can run ` +
+        `\`/clip connect-channel project:<name>\` here once to make this channel default to a project.`,
+      ephemeral: true,
+    });
+  }
+
+  const project = projects.find(
+    (p) => (p.name ?? "").toLowerCase() === requestedProjectName.toLowerCase() || p.id === requestedProjectName,
+  );
+  if (!project) {
+    const names = projects.map((p) => `\`${p.name ?? p.id}\``).join(", ") || "(none)";
+    return respondToInteraction({
+      type: 4,
+      content: `Project not found: **${requestedProjectName}**. Available: ${names}.`,
       ephemeral: true,
     });
   }
