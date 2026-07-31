@@ -171,6 +171,90 @@ describe("connectGateway", () => {
     vi.useRealTimers();
   });
 
+  it("detaches handlers and closes the orphaned socket on reconnect (COM-264 socket-leak regression)", async () => {
+    // The storm: cleanup() used to clear only the heartbeat timers and leave
+    // `ws` untouched. Every reconnect path (op 7 / op 9 / onclose) then created
+    // a NEW socket while the old one lingered with live onclose/onmessage/
+    // onerror handlers. When each orphan eventually closed, its onclose fired
+    // another reconnect → exponential zombie-socket multiplication (~40/sec).
+    // This test pins the invariant: after a reconnect trigger the old socket is
+    // force-closed and fully detached, so it can never drive a second reconnect.
+    class FakeWebSocket {
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      static instances: FakeWebSocket[] = [];
+
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: ((event: { code: number; reason: string }) => void) | null = null;
+      onerror: (() => void) | null = null;
+      sent: string[] = [];
+      readyState = 1; // OPEN
+
+      constructor(_url: string) {
+        FakeWebSocket.instances.push(this);
+      }
+
+      send(payload: string) {
+        this.sent.push(payload);
+      }
+
+      close() {
+        this.readyState = 3;
+      }
+    }
+
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+
+    vi.resetModules();
+    const { connectGateway } = await import("../src/gateway.js");
+    const ctx = makeCtx();
+    (ctx as unknown as { metrics: { write: () => Promise<void> } }).metrics = {
+      write: vi.fn().mockResolvedValue(undefined),
+    };
+    (ctx.http.fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: async () => ({ url: "wss://gateway.discord.test" }),
+    });
+
+    const result = await connectGateway(ctx, "fake-token", vi.fn(), undefined, {
+      listenForMessages: false,
+      includeMessageContent: false,
+    });
+
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    const socket0 = FakeWebSocket.instances[0];
+    expect(socket0.readyState).toBe(FakeWebSocket.OPEN);
+
+    // Discord asks a healthy session to reconnect (op 7). The immediate
+    // (zero-backoff) path routes through scheduleReconnect → cleanup → connect.
+    await socket0.onmessage?.({
+      data: JSON.stringify({ op: 7, d: null, s: null, t: null }),
+    });
+    // Flush the delay-0 reconnect timer.
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Exactly one fresh socket replaced the old one.
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(FakeWebSocket.instances[1]).not.toBe(socket0);
+
+    // The orphan was force-closed and fully detached.
+    expect(socket0.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(socket0.onclose).toBeNull();
+    expect(socket0.onmessage).toBeNull();
+    expect(socket0.onerror).toBeNull();
+    expect(socket0.onopen).toBeNull();
+
+    // Even if the dead transport fires a late close, no handler reacts — so no
+    // third socket is ever created. This is the storm that used to happen.
+    socket0.onclose?.({ code: 1006, reason: "orphan" });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    result.close();
+  });
+
   it("uses guild-only intents when message subscriptions are disabled", async () => {
     class FakeWebSocket {
       static instances: FakeWebSocket[] = [];
