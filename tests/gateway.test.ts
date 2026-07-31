@@ -341,3 +341,186 @@ describe("editDeferredResponse", () => {
     );
   });
 });
+
+// COM-264: the reconnect socket leak. cleanup() used to clear only the
+// heartbeat timers and leave the old WebSocket alive with its onclose/onmessage
+// handlers attached. Every reconnect (op 7, op 9, onclose, heartbeat timeout)
+// created a NEW socket while the orphan lingered; the orphan's eventual close
+// fired its onclose → another reconnect → exponential zombie multiplication that
+// stormed the gateway and tripped Discord's ~1000-sessions/day token reset.
+describe("gateway socket leak (COM-264)", () => {
+  let originalWebSocket: typeof globalThis.WebSocket;
+
+  // A controllable fake gateway socket. close() mirrors the real WHATWG socket:
+  // it transitions to CLOSED and fires onclose (if still attached) — so a test
+  // can prove that detaching onclose in cleanup() stops an orphan from ever
+  // observing its own close and driving a reconnect.
+  class FakeGatewaySocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    static instances: FakeGatewaySocket[] = [];
+
+    url: string;
+    readyState = 1; // OPEN — the SDK only IDENTIFYs after this anyway
+    onopen: (() => void) | null = null;
+    onmessage: ((event: { data: string }) => void) | null = null;
+    onclose: ((event: { code: number; reason: string }) => void) | null = null;
+    onerror: (() => void) | null = null;
+    sent: string[] = [];
+    closeCalls: Array<{ code?: number; reason?: string }> = [];
+
+    constructor(url: string) {
+      this.url = url;
+      FakeGatewaySocket.instances.push(this);
+    }
+
+    send(payload: string) {
+      if (this.readyState !== 1) {
+        throw new DOMException("Sent before connected.", "InvalidStateError");
+      }
+      this.sent.push(payload);
+    }
+
+    close(code?: number, reason?: string) {
+      this.closeCalls.push({ code, reason });
+      if (this.readyState === 3) return;
+      this.readyState = 3;
+      // Real sockets fire onclose after close(). If a caller detached the
+      // handler first (as cleanup() now does), nothing happens here.
+      this.onclose?.({ code: code ?? 1000, reason: reason ?? "" });
+    }
+  }
+
+  function makeMetricCtx(): PluginContext {
+    const ctx = makeCtx();
+    (ctx as unknown as { metrics: { write: () => Promise<void> } }).metrics = {
+      write: vi.fn().mockResolvedValue(undefined),
+    };
+    (ctx.http.fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: async () => ({ url: "wss://gateway.discord.test" }),
+    });
+    return ctx;
+  }
+
+  const hello = (intervalMs: number) => ({
+    data: JSON.stringify({ op: 10, d: { heartbeat_interval: intervalMs }, s: null, t: null }),
+  });
+  const ready = () => ({
+    data: JSON.stringify({
+      op: 0,
+      t: "READY",
+      s: 1,
+      d: { session_id: "sess-1", resume_gateway_url: "wss://resume.discord.test" },
+    }),
+  });
+
+  beforeEach(() => {
+    originalWebSocket = globalThis.WebSocket;
+    FakeGatewaySocket.instances = [];
+    vi.resetModules();
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0); // zero jitter → deterministic timers
+    globalThis.WebSocket = FakeGatewaySocket as unknown as typeof WebSocket;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    globalThis.WebSocket = originalWebSocket;
+  });
+
+  it("closes and detaches the old socket on an op-7 reconnect (orphan can't storm)", async () => {
+    const { connectGateway } = await import("../src/gateway.js");
+    const ctx = makeMetricCtx();
+    const result = await connectGateway(ctx, "tok", vi.fn(), undefined, {
+      listenForMessages: false,
+    });
+
+    const socket0 = FakeGatewaySocket.instances[0];
+    await socket0.onmessage?.(hello(10_000));
+    await socket0.onmessage?.(ready());
+
+    // Discord asks the session to reconnect (op 7).
+    await socket0.onmessage?.({
+      data: JSON.stringify({ op: 7, d: null, s: 2, t: null }),
+    });
+    // Flush the queued (immediate) reconnect.
+    await vi.advanceTimersByTimeAsync(1);
+
+    // The old socket was closed AND fully detached — it can never fire a
+    // handler again, so its eventual close is inert.
+    expect(socket0.closeCalls.length).toBeGreaterThanOrEqual(1);
+    expect(socket0.onclose).toBeNull();
+    expect(socket0.onmessage).toBeNull();
+    expect(socket0.onerror).toBeNull();
+
+    // Exactly one replacement socket exists (2 total), not a fan-out.
+    expect(FakeGatewaySocket.instances.length).toBe(2);
+
+    // Simulate Discord closing the orphan later — must NOT spawn a 3rd socket.
+    socket0.readyState = FakeGatewaySocket.OPEN;
+    socket0.close(1006, "orphan closed");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(FakeGatewaySocket.instances.length).toBe(2);
+
+    result.close();
+  });
+
+  it("spawns exactly one replacement socket per onclose reconnect", async () => {
+    const { connectGateway } = await import("../src/gateway.js");
+    const ctx = makeMetricCtx();
+    const result = await connectGateway(ctx, "tok", vi.fn());
+
+    const socket0 = FakeGatewaySocket.instances[0];
+    await socket0.onmessage?.(hello(10_000));
+    await socket0.onmessage?.(ready());
+
+    // Discord drops the connection (non-4004): onclose drives a reconnect.
+    socket0.onclose?.({ code: 1006, reason: "abnormal" });
+    // consecutiveFailures = 1 → backoff = 2000ms with zero jitter.
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(FakeGatewaySocket.instances.length).toBe(2);
+    // The dead socket was detached; re-closing it cannot add a 3rd socket.
+    expect(socket0.onclose).toBeNull();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(FakeGatewaySocket.instances.length).toBe(2);
+
+    result.close();
+  });
+
+  it("does not reset backoff until the session has survived a heartbeat interval", async () => {
+    const { connectGateway } = await import("../src/gateway.js");
+    const ctx = makeMetricCtx();
+    const result = await connectGateway(ctx, "tok", vi.fn());
+
+    const socket0 = FakeGatewaySocket.instances[0];
+    await socket0.onmessage?.(hello(10_000));
+
+    // First failure bumps consecutiveFailures to 1.
+    socket0.onclose?.({ code: 1006, reason: "abnormal" });
+    await vi.advanceTimersByTimeAsync(2000); // backoff, then reconnect
+    const socket1 = FakeGatewaySocket.instances[1];
+    expect(socket1).toBeDefined();
+
+    // New session becomes READY, but backoff must NOT reset immediately.
+    await socket1.onmessage?.(hello(10_000));
+    await socket1.onmessage?.(ready());
+
+    const stableLogged = () =>
+      (ctx.logger.info as unknown as ReturnType<typeof vi.fn>).mock.calls.some(
+        ([msg]) => msg === "Gateway session stable, resetting backoff",
+      );
+
+    await vi.advanceTimersByTimeAsync(5000); // < heartbeat interval
+    expect(stableLogged()).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(6001); // now past interval + 1000ms guard
+    expect(stableLogged()).toBe(true);
+
+    result.close();
+  });
+});
