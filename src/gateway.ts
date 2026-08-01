@@ -145,11 +145,15 @@ export async function connectGateway(
     return { close: () => {} };
   }
 
-  const gatewayUrl = await getGatewayUrl(ctx, token);
-  if (!gatewayUrl) {
+  const initialGatewayUrl = await getGatewayUrl(ctx, token);
+  if (!initialGatewayUrl) {
     ctx.logger.warn("Could not get Gateway URL, interactions will only work via webhook");
     return { close: () => {} };
   }
+  // Non-null-narrowed capture: TS discards the `if (!...)` narrowing inside the
+  // nested closures below (startHeartbeat), so hold the base URL as a plain
+  // string for the reconnect fallbacks.
+  const gatewayUrl: string = initialGatewayUrl;
 
   let ws: WebSocket | null = null;
   let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
@@ -160,6 +164,16 @@ export async function connectGateway(
   let closed = false;
   let consecutiveFailures = 0;
   let lastHeartbeatIntervalMs = 41250;
+  // Guards against more than one reconnect being scheduled at a time. Every
+  // reconnect trigger (op 7, op 9, onclose, heartbeat-ack timeout) routes
+  // through scheduleReconnect(), which flips this on until the queued connect()
+  // actually fires. Combined with detaching handlers from the dead socket in
+  // cleanup(), this makes it impossible for an orphaned socket to drive its own
+  // reconnect and multiply into a storm (COM-264).
+  let reconnecting = false;
+  // Fires > one heartbeat interval after READY/RESUMED. Only then is a session
+  // considered stable enough to reset the backoff counter — see markStable().
+  let stableTimeout: ReturnType<typeof setTimeout> | null = null;
   const listenForMessages = options.listenForMessages ?? Boolean(onMessage);
   const includeMessageContent = options.includeMessageContent ?? listenForMessages;
   const intents =
@@ -254,12 +268,15 @@ export async function connectGateway(
             const ready = payload.d as ReadyEvent;
             sessionId = ready.session_id;
             resumeUrl = ready.resume_gateway_url;
-            consecutiveFailures = 0;
+            // Don't reset backoff yet — only after the session survives a
+            // heartbeat interval (see markStable), so a flapping token stays
+            // throttled.
+            markStable();
             ctx.logger.info("Gateway ready", { sessionId });
           }
 
           if (payload.t === "RESUMED") {
-            consecutiveFailures = 0;
+            markStable();
             ctx.logger.info("Gateway resumed successfully");
           }
 
@@ -320,32 +337,32 @@ export async function connectGateway(
 
         case 7: {
           ctx.logger.info("Gateway requested reconnect");
-          cleanup();
           await ctx.metrics.write(METRIC_NAMES.gatewayReconnections, 1);
-          connect(resumeUrl ?? url, true);
+          // Discord asking a healthy session to reconnect+resume — no backoff,
+          // but still route through scheduleReconnect so the dead socket is torn
+          // down and only one reconnect can be in flight.
+          scheduleReconnect(resumeUrl ?? url, true, true);
           break;
         }
 
         case 9: {
           const resumable = payload.d as boolean;
           ctx.logger.info("Invalid session", { resumable });
-          cleanup();
           if (!resumable) {
             sessionId = null;
             sequence = null;
           }
           consecutiveFailures++;
           await ctx.metrics.write(METRIC_NAMES.gatewayReconnections, 1);
-          // Use the shared exponential-backoff schedule. A repeatedly-invalid
-          // session (e.g. shared-token eviction) must not re-IDENTIFY every 1-5s.
-          const delay = getReconnectDelay();
           if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
             ctx.logger.error("Gateway invalid-session loop, backing off", {
               consecutiveFailures,
-              delayMs: delay,
             });
           }
-          setTimeout(() => connect(url, resumable), delay);
+          // Shared exponential-backoff via scheduleReconnect. A repeatedly-
+          // invalid session (e.g. shared-token eviction) must not re-IDENTIFY
+          // every 1-5s.
+          scheduleReconnect(url, resumable);
           break;
         }
 
@@ -361,19 +378,22 @@ export async function connectGateway(
 
     ws.onclose = (event) => {
       ctx.logger.info("Gateway WebSocket closed", { code: event.code, reason: event.reason });
-      cleanup();
-      if (!closed && event.code !== 4004) {
-        consecutiveFailures++;
-        ctx.metrics.write(METRIC_NAMES.gatewayReconnections, 1).catch(() => {});
-        const delay = getReconnectDelay();
-        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          ctx.logger.error("Gateway reconnection failing repeatedly, backing off", {
-            consecutiveFailures,
-            delayMs: delay,
-          });
-        }
-        setTimeout(() => connect(resumeUrl ?? url, sessionId !== null), delay);
+      // 4004 = Authentication failed (bad/revoked token): reconnecting can't
+      // help and only burns gateway sessions, so tear down and stop.
+      if (closed || event.code === 4004) {
+        cleanup();
+        return;
       }
+      consecutiveFailures++;
+      ctx.metrics.write(METRIC_NAMES.gatewayReconnections, 1).catch(() => {});
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        ctx.logger.error("Gateway reconnection failing repeatedly, backing off", {
+          consecutiveFailures,
+        });
+      }
+      // scheduleReconnect() runs cleanup() (which detaches handlers from and
+      // closes this socket) before queuing exactly one backed-off reconnect.
+      scheduleReconnect(resumeUrl ?? url, sessionId !== null);
     };
 
     ws.onerror = (event) => {
@@ -397,12 +417,13 @@ export async function connectGateway(
       if (!sent) return;
       heartbeatAckTimeout = setTimeout(() => {
         ctx.logger.warn("Heartbeat ACK not received, forcing reconnect");
-        cleanup();
         consecutiveFailures++;
         ctx.metrics.write(METRIC_NAMES.gatewayReconnections, 1).catch(() => {});
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.close(4000, "Heartbeat timeout");
-        }
+        // The connection is dead but the socket may still report OPEN. Route
+        // through scheduleReconnect: it detaches + closes this socket (so its
+        // eventual onclose can't spawn a second reconnect) and queues exactly
+        // one backed-off reconnect. Resume if we still hold a session id.
+        scheduleReconnect(resumeUrl ?? gatewayUrl, sessionId !== null);
       }, intervalMs * 2);
     };
 
@@ -413,6 +434,17 @@ export async function connectGateway(
     }, jitter);
   }
 
+  // Tear down the current socket and its timers. Before COM-264 this only
+  // cleared the heartbeat timers and left `ws` untouched: every reconnect path
+  // (op 7, op 9, onclose) created a *new* socket while the old one lingered with
+  // live onclose/onmessage/onerror handlers. Each orphan's eventual close fired
+  // its onclose → another reconnect → exponential zombie-socket multiplication
+  // (~40 reconnects/sec, 147K–347K/hr) until Discord force-reset the bot token.
+  //
+  // Now cleanup() DETACHES all handlers from the old socket before closing it,
+  // so an orphaned socket can never observe its own close and can never drive a
+  // reconnect. Detaching first also means the intentional close() below does not
+  // re-enter this cleanup via onclose.
   function cleanup() {
     if (heartbeatInterval) {
       clearInterval(heartbeatInterval);
@@ -422,17 +454,79 @@ export async function connectGateway(
       clearTimeout(heartbeatAckTimeout);
       heartbeatAckTimeout = null;
     }
+    if (stableTimeout) {
+      clearTimeout(stableTimeout);
+      stableTimeout = null;
+    }
+    const dead = ws;
+    ws = null;
+    if (dead) {
+      // Detach BEFORE closing so the pending close does not fire onclose and
+      // schedule yet another reconnect.
+      dead.onopen = null;
+      dead.onmessage = null;
+      dead.onclose = null;
+      dead.onerror = null;
+      try {
+        if (
+          dead.readyState === WebSocket.OPEN ||
+          dead.readyState === WebSocket.CONNECTING
+        ) {
+          dead.close(1000, "Reconnecting");
+        }
+      } catch (error) {
+        ctx.logger.warn("Gateway socket close failed during cleanup", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  // Route every reconnect trigger through here. It is re-entrancy safe: if a
+  // reconnect is already queued, additional triggers (e.g. the dead socket's
+  // onclose racing an op-9 frame) are ignored. Tears down the current socket via
+  // cleanup(), then schedules a single backed-off connect(). `immediate` is used
+  // by the op-7 path, which is Discord asking us to reconnect a healthy session
+  // and should not wait out the backoff schedule.
+  function scheduleReconnect(url: string, resume: boolean, immediate = false) {
+    if (closed) return;
+    if (reconnecting) return;
+    reconnecting = true;
+    cleanup();
+    const delay = immediate ? 0 : getReconnectDelay();
+    setTimeout(() => {
+      reconnecting = false;
+      connect(url, resume);
+    }, delay);
+  }
+
+  // Reset the backoff counter only once a session has proven stable. Resetting
+  // consecutiveFailures to 0 the instant READY/RESUMED arrives lets a session
+  // that flaps (READY → immediate close) clear the backoff on every cycle, so
+  // the exponential schedule never actually restrains a flapping token. Instead
+  // we wait until the session has survived longer than one heartbeat interval;
+  // cleanup() clears this timer, so a session that dies early never resets.
+  function markStable() {
+    if (stableTimeout) clearTimeout(stableTimeout);
+    stableTimeout = setTimeout(() => {
+      stableTimeout = null;
+      if (consecutiveFailures > 0) {
+        ctx.logger.info("Gateway session stable, resetting backoff", {
+          consecutiveFailures,
+        });
+      }
+      consecutiveFailures = 0;
+    }, lastHeartbeatIntervalMs + 1000);
   }
 
   connect(gatewayUrl, false);
 
   return {
     close: () => {
+      // Setting closed first makes cleanup()'s close and any in-flight
+      // scheduleReconnect no-op out — no reconnect can be queued after this.
       closed = true;
       cleanup();
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.close(1000, "Plugin shutting down");
-      }
     },
   };
 }
