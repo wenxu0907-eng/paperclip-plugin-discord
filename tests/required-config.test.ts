@@ -3,23 +3,30 @@ import { describe, it, expect, vi } from "vitest";
 // ---------------------------------------------------------------------------
 // Issue #53: setup() used to "warn and return" when required config was
 // missing, silently disabling the plugin (and falling through to an empty
-// defaultChannelId). It now throws a clear, plugin-scoped error so a
-// misconfiguration fails fast and visibly.
+// defaultChannelId). It was changed to throw so a misconfiguration failed
+// fast and visibly.
 //
-// These tests verify setup() throws when discordBotTokenRef or defaultChannelId
-// are missing, and succeeds when both are present.
+// COM-430 revised that: a throw inside setup() fails worker `initialize`, which
+// marks the WHOLE plugin `error` and stops it from activating at all — and the
+// thrown message replaces the health diagnostic the board needs to fix the
+// config. Missing config now disables the runtime loudly instead: setup()
+// resolves, an error is logged naming the missing field, no jobs are
+// registered, and onHealth() reports `degraded`.
+//
+// These tests pin that contract, including the "loudly" half — a silent
+// warn-and-return is still a regression.
 // ---------------------------------------------------------------------------
 
-// Capture the setup function from definePlugin by mocking the SDK.
+// Capture the plugin definition from definePlugin by mocking the SDK.
 // vi.hoisted ensures the variable exists before the mock factory runs.
-const { capturedSetups } = vi.hoisted(() => {
-  const capturedSetups: Array<(ctx: any) => Promise<void>> = [];
-  return { capturedSetups };
+const { capturedDefs } = vi.hoisted(() => {
+  const capturedDefs: Array<any> = [];
+  return { capturedDefs };
 });
 
 vi.mock("@paperclipai/plugin-sdk", () => ({
   definePlugin: (def: any) => {
-    if (def.setup) capturedSetups.push(def.setup);
+    capturedDefs.push(def);
     return Object.freeze({ definition: def });
   },
   runWorker: vi.fn(),
@@ -29,11 +36,15 @@ vi.mock("@paperclipai/plugin-sdk", () => ({
 // This must be a static import so vitest hoists the mock before it.
 import "../src/worker.js";
 
-function getSetup(): (ctx: any) => Promise<void> {
-  if (capturedSetups.length === 0) {
-    throw new Error("setup() was not captured — definePlugin mock may not be active");
+function getDefinition(): any {
+  if (capturedDefs.length === 0) {
+    throw new Error("definePlugin was not captured — the SDK mock may not be active");
   }
-  return capturedSetups[capturedSetups.length - 1];
+  return capturedDefs[capturedDefs.length - 1];
+}
+
+function getSetup(): (ctx: any) => Promise<void> {
+  return getDefinition().setup;
 }
 
 /**
@@ -95,40 +106,63 @@ function validConfig(overrides: Record<string, unknown> = {}) {
   };
 }
 
-describe("setup() required-config validation (issue #53)", () => {
-  it("throws when discordBotTokenRef is missing", async () => {
-    const { ctx } = buildPluginContext(validConfig({ discordBotTokenRef: undefined }));
-    await expect(getSetup()(ctx)).rejects.toThrow(/discordBotTokenRef is required/);
-  });
+/** Collect every string argument the logger saw, across all levels. */
+function loggedText(ctx: any): string {
+  return [ctx.logger.error, ctx.logger.warn, ctx.logger.info]
+    .flatMap((fn: any) => fn.mock.calls)
+    .map((call: unknown[]) => JSON.stringify(call))
+    .join("\n");
+}
 
-  it("throws when discordBotTokenRef is empty/whitespace", async () => {
-    const { ctx } = buildPluginContext(validConfig({ discordBotTokenRef: "   " }));
-    await expect(getSetup()(ctx)).rejects.toThrow(/discordBotTokenRef is required/);
-  });
-
-  it("throws when defaultChannelId is missing", async () => {
-    const { ctx } = buildPluginContext(validConfig({ defaultChannelId: undefined }));
-    await expect(getSetup()(ctx)).rejects.toThrow(/defaultChannelId is required/);
-  });
-
-  it("throws when defaultChannelId is empty/whitespace", async () => {
-    const { ctx } = buildPluginContext(validConfig({ defaultChannelId: "  " }));
-    await expect(getSetup()(ctx)).rejects.toThrow(/defaultChannelId is required/);
-  });
-
-  it("scopes the error message to the plugin", async () => {
-    const { ctx } = buildPluginContext(validConfig({ discordBotTokenRef: "" }));
-    await expect(getSetup()(ctx)).rejects.toThrow(/paperclip-plugin-discord/);
-  });
-
-  it("does NOT warn-and-return — the old soft path is gone", async () => {
-    const { ctx } = buildPluginContext(validConfig({ discordBotTokenRef: "" }));
-    await expect(getSetup()(ctx)).rejects.toThrow();
-    // The removed code logged a warning instead of throwing; ensure that path
-    // is not what handled the missing token.
-    expect(ctx.logger.warn).not.toHaveBeenCalledWith(
-      expect.stringContaining("plugin disabled"),
+describe("setup() required-config validation (issue #53, revised by COM-430)", () => {
+  it("disables the runtime instead of throwing when discordBotTokenRef is missing", async () => {
+    const { ctx, registeredJobs } = buildPluginContext(
+      validConfig({ discordBotTokenRef: undefined }),
     );
+    await expect(getSetup()(ctx)).resolves.toBeUndefined();
+    expect(loggedText(ctx)).toMatch(/discordBotTokenRef/);
+    expect(registeredJobs.size).toBe(0);
+  });
+
+  it("disables the runtime when discordBotTokenRef is empty/whitespace", async () => {
+    const { ctx, registeredJobs } = buildPluginContext(validConfig({ discordBotTokenRef: "   " }));
+    await expect(getSetup()(ctx)).resolves.toBeUndefined();
+    expect(loggedText(ctx)).toMatch(/discordBotTokenRef/);
+    expect(registeredJobs.size).toBe(0);
+  });
+
+  it("disables the runtime when defaultChannelId is missing", async () => {
+    const { ctx, registeredJobs } = buildPluginContext(validConfig({ defaultChannelId: undefined }));
+    await expect(getSetup()(ctx)).resolves.toBeUndefined();
+    expect(loggedText(ctx)).toMatch(/defaultChannelId/);
+    expect(registeredJobs.size).toBe(0);
+  });
+
+  it("disables the runtime when defaultChannelId is empty/whitespace", async () => {
+    const { ctx, registeredJobs } = buildPluginContext(validConfig({ defaultChannelId: "  " }));
+    await expect(getSetup()(ctx)).resolves.toBeUndefined();
+    expect(loggedText(ctx)).toMatch(/defaultChannelId/);
+    expect(registeredJobs.size).toBe(0);
+  });
+
+  it("scopes the diagnostic to the plugin", async () => {
+    const { ctx } = buildPluginContext(validConfig({ discordBotTokenRef: "" }));
+    await getSetup()(ctx);
+    expect(loggedText(ctx)).toMatch(/paperclip-plugin-discord/);
+  });
+
+  it("reports degraded health so the board can see why Discord is off", async () => {
+    const { ctx } = buildPluginContext(validConfig({ discordBotTokenRef: "" }));
+    await getSetup()(ctx);
+    const health = await getDefinition().onHealth();
+    expect(health.status).toBe("degraded");
+    expect(String(health.message)).toMatch(/discordBotTokenRef/);
+  });
+
+  it("does NOT fail silently — the missing field is logged at error level", async () => {
+    const { ctx } = buildPluginContext(validConfig({ discordBotTokenRef: "" }));
+    await getSetup()(ctx);
+    expect(ctx.logger.error).toHaveBeenCalled();
   });
 
   it("succeeds when both required fields are present", async () => {
