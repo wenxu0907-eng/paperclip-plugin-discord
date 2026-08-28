@@ -60,7 +60,7 @@ export function _resetCompanyIdCache(): void {
 // by scanning per-company scoped config, and only fall back to the global
 // default resolution when no channel matches (e.g. a DM or an unmapped channel).
 // ---------------------------------------------------------------------------
-type ScopedConfigGet = (params?: { companyId?: string }) => Promise<Record<string, unknown>>;
+type ScopedConfigGet = (companyId?: string) => Promise<Record<string, unknown>>;
 
 const _channelCompanyCache = new Map<string, string>();
 
@@ -103,7 +103,7 @@ export async function resolveCompanyIdForChannel(
           return companyId;
         }
 
-        const cfg = (await scopedConfigGet({ companyId })) ?? {};
+        const cfg = (await scopedConfigGet(companyId)) ?? {};
         const channelCandidates: unknown[] = [cfg.defaultChannelId];
         const companyChannels = cfg.companyChannels as Record<string, string> | undefined;
         if (companyChannels) channelCandidates.push(...Object.values(companyChannels));

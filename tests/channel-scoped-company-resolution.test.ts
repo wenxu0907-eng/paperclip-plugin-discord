@@ -34,8 +34,8 @@ function buildCtx(companies: Company[], instanceDefaultCompanyId?: string) {
       ),
     },
     config: {
-      get: vi.fn(async (params?: { companyId?: string }) => {
-        const c = companies.find((x) => x.id === params?.companyId);
+      get: vi.fn(async (companyId?: string) => {
+        const c = companies.find((x) => x.id === companyId);
         if (!c) return {};
         return {
           defaultChannelId: c.defaultChannelId ?? "",

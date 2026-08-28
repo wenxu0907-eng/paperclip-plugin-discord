@@ -4,7 +4,7 @@ import { describe, it, expect, vi } from "vitest";
 // COM-108 / COM-118: company-scoped host compatibility.
 //
 // Paperclip plugin config is stored PER COMPANY. The host hands workers an
-// empty bootstrap config and expects `ctx.config.get({ companyId })` for scoped
+// empty bootstrap config and expects `ctx.config.get(companyId)` for scoped
 // values, plus `ctx.secrets.resolve(ref, { companyId, configPath })` for
 // per-company secret bindings. Prior to this fix, worker.ts called the
 // arg-less forms, so on this host the instance config came back `{}` and setup()
@@ -33,8 +33,8 @@ function buildCtx(opts: {
   const resolveSpy = vi.fn(
     opts.resolve ?? (async () => "resolved-token"),
   );
-  const configGet = vi.fn(async (params?: { companyId?: string }) => {
-    if (params?.companyId) return opts.configByCompany[params.companyId] ?? {};
+  const configGet = vi.fn(async (companyId?: string) => {
+    if (companyId) return opts.configByCompany[companyId] ?? {};
     return opts.instanceConfig ?? {};
   });
 
@@ -79,7 +79,7 @@ describe("getCompanyScopedRuntimeConfig (COM-108/COM-118 host compat)", () => {
 
     await getCompanyScopedRuntimeConfig(ctx);
 
-    expect(configGet).toHaveBeenCalledWith({ companyId: "company-a" });
+    expect(configGet).toHaveBeenCalledWith("company-a");
   });
 
   it("skips companies without a complete Discord config and returns the first configured one", async () => {
@@ -176,8 +176,8 @@ function buildSetupCtx(companyConfig: Record<string, unknown>) {
   const registeredJobs = new Map<string, Function>();
   const ctx = {
     config: {
-      get: vi.fn(async (params?: { companyId?: string }) =>
-        params?.companyId ? companyConfig : {},
+      get: vi.fn(async (companyId?: string) =>
+        companyId ? companyConfig : {},
       ),
     },
     secrets: { resolve: vi.fn().mockResolvedValue("fake-bot-token") },
@@ -218,6 +218,6 @@ describe("setup() boots via company-scoped config when instance config is empty"
     await expect(getSetup()(ctx)).resolves.toBeUndefined();
     expect(registeredJobs.size).toBeGreaterThan(0);
     // Confirms the company-scoped read happened.
-    expect(ctx.config.get).toHaveBeenCalledWith({ companyId: "company-a" });
+    expect(ctx.config.get).toHaveBeenCalledWith("company-a");
   });
 });
