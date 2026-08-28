@@ -64,10 +64,17 @@ import {
   untrackPendingEscalation,
   collectPendingEscalationIds,
 } from "./escalation-state.js";
+import {
+  describeSecretRef,
+  hasSecretRef,
+  normalizeSecretRef,
+  type SecretRefBinding,
+  type SecretRefValue,
+} from "./secret-ref.js";
 
 type DiscordConfig = {
-  discordBotTokenRef: string;
-  paperclipBoardApiKeyRef?: string;
+  discordBotTokenRef: SecretRefValue;
+  paperclipBoardApiKeyRef?: SecretRefValue;
   defaultGuildId: string;
   defaultChannelId: string;
   approvalsChannelId: string;
@@ -191,7 +198,7 @@ function normalizeDiscordIdList(values: unknown): string[] {
 // ---------------------------------------------------------------------------
 type ScopedConfigGet = (params?: { companyId?: string }) => Promise<Record<string, unknown>>;
 type ScopedSecretResolve = (
-  secretRef: string,
+  secretRef: string | SecretRefBinding,
   opts?: { companyId?: string; configPath?: string },
 ) => Promise<string>;
 
@@ -234,14 +241,25 @@ export async function getCompanyScopedRuntimeConfig(
     try {
       const rawConfig = (await scopedConfigGet({ companyId })) ?? {};
       const config = { ...DEFAULT_CONFIG, ...rawConfig } as DiscordConfig;
-      if (!config.discordBotTokenRef || !config.defaultChannelId) continue;
+      if (!hasSecretRef(config.discordBotTokenRef) || !config.defaultChannelId) continue;
 
-      const token = await scopedSecretResolve(config.discordBotTokenRef, {
+      // The host accepts only `{ type: "secret_ref", secretId }`; stored config
+      // may still hold a legacy bare UUID (COM-430).
+      const tokenRef = normalizeSecretRef(config.discordBotTokenRef);
+      if (!tokenRef) {
+        ctx.logger.warn("Discord bot token ref is not a usable secret reference", {
+          companyId,
+          tokenRef: describeSecretRef(config.discordBotTokenRef),
+        });
+        continue;
+      }
+      const token = await scopedSecretResolve(tokenRef, {
         companyId,
         configPath: "discordBotTokenRef",
       });
-      const paperclipBoardApiKey = config.paperclipBoardApiKeyRef
-        ? await scopedSecretResolve(config.paperclipBoardApiKeyRef, {
+      const boardKeyRef = normalizeSecretRef(config.paperclipBoardApiKeyRef);
+      const paperclipBoardApiKey = boardKeyRef
+        ? await scopedSecretResolve(boardKeyRef, {
             companyId,
             configPath: "paperclipBoardApiKeyRef",
           })
@@ -505,26 +523,48 @@ const plugin = definePlugin({
       );
     } else {
       // --- Fallback path: instance-level config (single-tenant / legacy host) ---
-      const rawConfig = await ctx.config.get();
+      // `config.get()` without a companyId is rejected on company-scoped hosts
+      // ("company context is required"). That is a configuration signal, not a
+      // reason to abort activation — letting it escape killed the worker and
+      // took the whole plugin to `error` status (COM-430). Degrade instead.
+      let rawConfig: Record<string, unknown>;
+      try {
+        rawConfig = ((await ctx.config.get()) ?? {}) as Record<string, unknown>;
+      } catch (err) {
+        runtimeHealth = {
+          status: "degraded",
+          message:
+            "No company has a complete Discord configuration, and instance-level config is unavailable on this host.",
+          details: { error: String(err) },
+        };
+        ctx.logger.error(
+          "Discord plugin runtime disabled: no company-scoped config resolved and instance-level config.get() was rejected",
+          { error: String(err) },
+        );
+        return;
+      }
       ctx.logger.info(`Discord plugin config: ${JSON.stringify(rawConfig)}`);
       config = {
         ...DEFAULT_CONFIG,
-        ...(rawConfig as Record<string, unknown>),
+        ...rawConfig,
       } as DiscordConfig;
 
-      // Hard validation: when there is no company-scoped config AND no instance
-      // config, fail fast with a clear, plugin-scoped error. (issue #53)
-      if (!config.discordBotTokenRef || !String(config.discordBotTokenRef).trim()) {
-        throw new Error(
-          `[${PLUGIN_ID}] discordBotTokenRef is required but is missing or empty. ` +
-            `Configure a Discord bot token reference before enabling the plugin.`,
-        );
-      }
+      // Missing required config disables the runtime with a clear, plugin-scoped
+      // diagnostic. It must not throw: a throw here fails worker initialize and
+      // marks the plugin `error`, which also loses the health message the board
+      // needs to fix the config. (issue #53, revised by COM-430)
+      const missing: string[] = [];
+      if (!hasSecretRef(config.discordBotTokenRef)) missing.push("discordBotTokenRef");
       if (!config.defaultChannelId || !String(config.defaultChannelId).trim()) {
-        throw new Error(
-          `[${PLUGIN_ID}] defaultChannelId is required but is missing or empty. ` +
-            `Set the default Discord channel ID before enabling the plugin.`,
-        );
+        missing.push("defaultChannelId");
+      }
+      if (missing.length > 0) {
+        const message =
+          `[${PLUGIN_ID}] Discord runtime disabled: ${missing.join(", ")} is required but missing or empty. ` +
+          `Configure the plugin for a company before enabling it.`;
+        runtimeHealth = { status: "degraded", message, details: { missing } };
+        ctx.logger.error(message, { missing });
+        return;
       }
 
       const resolvedToken = await resolveStartupDiscordBotToken(ctx, config.discordBotTokenRef, (health) => {
@@ -535,9 +575,10 @@ const plugin = definePlugin({
         return;
       }
       token = resolvedToken;
-      if (config.paperclipBoardApiKeyRef) {
+      const boardKeyRef = normalizeSecretRef(config.paperclipBoardApiKeyRef);
+      if (boardKeyRef) {
         try {
-          paperclipBoardApiKey = await ctx.secrets.resolve(config.paperclipBoardApiKeyRef);
+          paperclipBoardApiKey = await (ctx.secrets.resolve as unknown as ScopedSecretResolve)(boardKeyRef);
         } catch (err) {
           ctx.logger.warn("Discord plugin could not resolve Paperclip board API key; board features are disabled", {
             error: String(err),
@@ -1852,11 +1893,9 @@ const plugin = definePlugin({
   },
 
   async onValidateConfig(config) {
-    if (
-      !config.discordBotTokenRef ||
-      typeof config.discordBotTokenRef !== "string" ||
-      !config.discordBotTokenRef.trim()
-    ) {
+    // Accepts a legacy bare-UUID string or the `{ type: "secret_ref" }` object
+    // the board UI now writes (COM-430).
+    if (!hasSecretRef(config.discordBotTokenRef as SecretRefValue)) {
       return { ok: false, errors: [`[${PLUGIN_ID}] discordBotTokenRef is required`] };
     }
     if (

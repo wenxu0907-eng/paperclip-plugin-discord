@@ -8,6 +8,30 @@ import {
   WEBHOOK_KEYS,
 } from "./constants.js";
 
+/**
+ * Type fragment for `format: "secret-ref"` fields (COM-430).
+ *
+ * The board UI writes secret pickers as `{ type: "secret_ref", secretId,
+ * version }`, and the host's plugin secrets handler now accepts only that
+ * shape. Declaring `type: "string"` made the UI's own output fail Ajv
+ * validation on save. Accept both so legacy bare-UUID configs still validate
+ * while new saves use the object form.
+ */
+const SECRET_REF_TYPE = {
+  anyOf: [
+    { type: "string" },
+    {
+      type: "object",
+      properties: {
+        type: { const: "secret_ref" },
+        secretId: { type: "string" },
+        version: { type: "string" },
+      },
+      required: ["type", "secretId"],
+    },
+  ],
+} as const;
+
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
   apiVersion: 1,
@@ -48,7 +72,7 @@ const manifest: PaperclipPluginManifestV1 = {
     type: "object",
     properties: {
       discordBotTokenRef: {
-        type: "string",
+        ...SECRET_REF_TYPE,
         format: "secret-ref",
         title: "Discord Bot Token (secret reference)",
         description:
@@ -56,7 +80,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.discordBotTokenRef,
       },
       paperclipBoardApiKeyRef: {
-        type: "string",
+        ...SECRET_REF_TYPE,
         format: "secret-ref",
         title: "Paperclip Board API Key (secret reference)",
         description:
