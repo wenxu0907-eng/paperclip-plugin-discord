@@ -183,20 +183,20 @@ function normalizeDiscordIdList(values: unknown): string[] {
 //
 // Paperclip plugin config is stored PER COMPANY, not instance-wide. The host
 // hands workers an empty bootstrap config and expects them to call
-// `ctx.config.get({ companyId })` for scoped values, and to resolve secret
+// `ctx.config.get(companyId)` for scoped values, and to resolve secret
 // references with `ctx.secrets.resolve(ref, { companyId, configPath })` so the
 // per-company secret binding (companySecretBindings) can be located.
-// See server: `plugin-loader.ts` ("must call ctx.config.get({ companyId })")
+// See SDK worker context: `ctx.config.get(companyId)` wraps the RPC payload.
 // and `plugin-secrets-handler.ts` (PluginSecretsResolveParams companyId/configPath).
 //
-// The published SDK `.d.ts` under-declares these params (config.get() takes no
-// args, secrets.resolve(ref) takes only the ref), so we widen the call sites
+// The published SDK `.d.ts` under-declares the secret resolution params
+// (secrets.resolve(ref) takes only the ref), so we widen that call site
 // locally. The arg-less forms return `{}` / fail secret resolution on this host,
 // which previously took the whole plugin down at boot (empty config -> throw)
 // and disabled runtime (secret resolve failure). These types restore the
 // host-supported behavior without editing the SDK.
 // ---------------------------------------------------------------------------
-type ScopedConfigGet = (params?: { companyId?: string }) => Promise<Record<string, unknown>>;
+type ScopedConfigGet = (companyId?: string) => Promise<Record<string, unknown>>;
 type ScopedSecretResolve = (
   secretRef: string | SecretRefBinding,
   opts?: { companyId?: string; configPath?: string },
@@ -239,7 +239,7 @@ export async function getCompanyScopedRuntimeConfig(
 
   for (const companyId of candidates) {
     try {
-      const rawConfig = (await scopedConfigGet({ companyId })) ?? {};
+      const rawConfig = (await scopedConfigGet(companyId)) ?? {};
       const config = { ...DEFAULT_CONFIG, ...rawConfig } as DiscordConfig;
       if (!hasSecretRef(config.discordBotTokenRef) || !config.defaultChannelId) continue;
 
@@ -296,7 +296,7 @@ async function resolveChannel(
   //    that does not have its own specific map.
   try {
     const scopedConfigGet = ctx.config.get as unknown as ScopedConfigGet | undefined;
-    const rawConfig = (await scopedConfigGet?.({ companyId })) as DiscordConfig | undefined;
+    const rawConfig = (await scopedConfigGet?.(companyId)) as DiscordConfig | undefined;
     const general = rawConfig?.companyChannels;
     if (general && companyId && general[companyId]) {
       return normalizeDiscordId(general[companyId]);

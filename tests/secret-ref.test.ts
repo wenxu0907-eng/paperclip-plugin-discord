@@ -73,7 +73,7 @@ describe("isSecretRefBinding / hasSecretRef", () => {
 
 function buildCtx(config: Record<string, unknown>, resolve: any) {
   return {
-    config: { get: vi.fn().mockResolvedValue(config) },
+    config: { get: vi.fn(async (companyId?: string) => (companyId ? config : {})) },
     secrets: { resolve },
     companies: { list: vi.fn().mockResolvedValue([{ id: "company-1" }]) },
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
