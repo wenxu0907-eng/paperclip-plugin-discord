@@ -273,6 +273,100 @@ export async function getCompanyScopedRuntimeConfig(
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Per-company notification gating (COM-435)
+//
+// Plugin config — including every `notifyOn*` toggle — is stored PER COMPANY,
+// but the worker boots with a single bootstrap config taken from the first
+// fully-configured company (see getCompanyScopedRuntimeConfig). Gating
+// `ctx.events.on(...)` on that one config leaked notifications across tenants:
+// a company that unchecked "Notify on issue created" still received the message
+// because some *other* company had the toggle on, and `notify()` then routed
+// the event to the unchecking company's own channel via `companyChannels`.
+//
+// The gate below splits the decision in two:
+//   * registration — subscribe when ANY company wants the event (a handler that
+//     was never registered can never be re-enabled without a worker restart);
+//   * delivery — re-check the toggle against the EVENT's own company before
+//     posting, reading that company's live config.
+//
+// Per-event lookups are cached briefly so toggle changes take effect without a
+// worker restart while a burst of events costs at most one config RPC.
+// ---------------------------------------------------------------------------
+
+export type NotifyToggleKey =
+  | "notifyOnIssueCreated"
+  | "notifyOnIssueInReview"
+  | "notifyOnIssueDone"
+  | "notifyOnIssueBlocked"
+  | "notifyOnBoardInputRequested"
+  | "notifyOnApprovalCreated"
+  | "notifyOnAgentError"
+  | "notifyOnRunStarted"
+  | "notifyOnRunFinished";
+
+export interface NotifyGate {
+  /** True when at least one company subscribes to the event. Gates registration. */
+  anyCompanyEnables(key: NotifyToggleKey): boolean;
+  /** True when the event's own company subscribes to it. Gates delivery. */
+  isEnabled(companyId: string | null | undefined, key: NotifyToggleKey): Promise<boolean>;
+}
+
+export const NOTIFY_CONFIG_CACHE_TTL_MS = 30_000;
+
+export async function createNotifyGate(
+  ctx: PluginContext,
+  bootstrapConfig: DiscordConfig,
+  opts?: { ttlMs?: number },
+): Promise<NotifyGate> {
+  const ttlMs = opts?.ttlMs ?? NOTIFY_CONFIG_CACHE_TTL_MS;
+  const scopedConfigGet = ctx.config.get as unknown as ScopedConfigGet | undefined;
+  const cache = new Map<string, { config: DiscordConfig; expiresAt: number }>();
+
+  const loadCompanyConfig = async (companyId: string): Promise<DiscordConfig | null> => {
+    const cached = cache.get(companyId);
+    if (cached && cached.expiresAt > Date.now()) return cached.config;
+    try {
+      const raw = (await scopedConfigGet?.(companyId)) ?? {};
+      // An empty payload means "this company has no Discord config row" — not
+      // "every toggle is off". Fall back to the bootstrap config in that case.
+      if (Object.keys(raw).length === 0) return null;
+      const config = { ...DEFAULT_CONFIG, ...raw } as DiscordConfig;
+      cache.set(companyId, { config, expiresAt: Date.now() + ttlMs });
+      return config;
+    } catch (err) {
+      ctx.logger.debug("Unable to load per-company notification config", {
+        companyId,
+        error: String(err),
+      });
+      return null;
+    }
+  };
+
+  const snapshot: DiscordConfig[] = [];
+  try {
+    const companies = await ctx.companies.list();
+    for (const company of companies) {
+      if (!company?.id) continue;
+      const config = await loadCompanyConfig(company.id);
+      if (config) snapshot.push(config);
+    }
+  } catch (err) {
+    ctx.logger.warn("Unable to list companies while building notification gate", {
+      error: String(err),
+    });
+  }
+  if (snapshot.length === 0) snapshot.push(bootstrapConfig);
+
+  return {
+    anyCompanyEnables: (key) => snapshot.some((config) => config[key] === true),
+    isEnabled: async (companyId, key) => {
+      const config = (companyId ? await loadCompanyConfig(companyId) : null) ?? bootstrapConfig;
+      return config[key] === true;
+    },
+  };
+}
+
 async function resolveChannel(
   ctx: PluginContext,
   companyId: string,
@@ -848,8 +942,20 @@ const plugin = definePlugin({
       }
     };
 
-    if (config.notifyOnIssueCreated) {
+    // Notification toggles are per-company (COM-435): register when ANY company
+    // subscribes, then re-check the event's own company before posting.
+    const notifyGate = await createNotifyGate(ctx, config);
+    const notifyCompanyOf = (event: PluginEvent): string | null => {
+      if (typeof event.companyId === "string" && event.companyId) return event.companyId;
+      const payloadCompanyId = (event.payload as Record<string, unknown> | undefined)?.companyId;
+      return typeof payloadCompanyId === "string" && payloadCompanyId ? payloadCompanyId : null;
+    };
+    const notifyAllowed = (event: PluginEvent, key: NotifyToggleKey): Promise<boolean> =>
+      notifyGate.isEnabled(notifyCompanyOf(event), key);
+
+    if (notifyGate.anyCompanyEnables("notifyOnIssueCreated")) {
       ctx.events.on("issue.created", async (event: PluginEvent) => {
+        if (!(await notifyAllowed(event, "notifyOnIssueCreated"))) return;
         const payload = await enrichIssueNotificationPayload(ctx, event);
         await notify({ ...event, payload }, formatIssueCreated);
       });
@@ -859,13 +965,17 @@ const plugin = definePlugin({
     // "blocked" transitions. Each branch is independently gated by its own
     // toggle so the board can subscribe to review-ready issues, completed
     // issues, blocked issues, or any combination.
-    if (config.notifyOnIssueInReview || config.notifyOnIssueDone || config.notifyOnIssueBlocked) {
+    if (
+      notifyGate.anyCompanyEnables("notifyOnIssueInReview") ||
+      notifyGate.anyCompanyEnables("notifyOnIssueDone") ||
+      notifyGate.anyCompanyEnables("notifyOnIssueBlocked")
+    ) {
       ctx.events.on("issue.updated", async (event: PluginEvent) => {
         const payload = await enrichIssueNotificationPayload(ctx, event);
         const status = payload.status;
 
         if (status === "blocked") {
-          if (!config.notifyOnIssueBlocked) return;
+          if (!(await notifyAllowed(event, "notifyOnIssueBlocked"))) return;
 
           // De-dupe repeated blocked updates keyed on the latest activity
           // marker so an issue that receives several edits while blocked only
@@ -889,7 +999,7 @@ const plugin = definePlugin({
         }
 
         if (status === "in_review") {
-          if (!config.notifyOnIssueInReview) return;
+          if (!(await notifyAllowed(event, "notifyOnIssueInReview"))) return;
 
           // De-dupe repeated in_review updates keyed on the latest activity
           // marker so an issue that receives several edits while under review
@@ -913,7 +1023,7 @@ const plugin = definePlugin({
         }
 
         if (status === "done") {
-          if (!config.notifyOnIssueDone) return;
+          if (!(await notifyAllowed(event, "notifyOnIssueDone"))) return;
 
           const completionMarker = String(payload.completedAt ?? "");
           if (completionMarker) {
@@ -940,9 +1050,10 @@ const plugin = definePlugin({
     // Board-input requests: an agent created an issue-thread interaction that
     // needs a human decision — a confirmation card, a question, or a set of
     // proposed tasks. The server forwards these as `issue.interaction.created`.
-    if (config.notifyOnBoardInputRequested) {
+    if (notifyGate.anyCompanyEnables("notifyOnBoardInputRequested")) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       ctx.events.on("issue.interaction.created" as any, async (event: PluginEvent) => {
+        if (!(await notifyAllowed(event, "notifyOnBoardInputRequested"))) return;
         const raw = (event.payload ?? {}) as Record<string, unknown>;
         const kind = String(raw.interactionKind ?? "");
         const status = String(raw.interactionStatus ?? "pending");
@@ -972,8 +1083,9 @@ const plugin = definePlugin({
       });
     }
 
-    if (config.notifyOnApprovalCreated) {
+    if (notifyGate.anyCompanyEnables("notifyOnApprovalCreated")) {
       ctx.events.on("approval.created", async (event: PluginEvent) => {
+        if (!(await notifyAllowed(event, "notifyOnApprovalCreated"))) return;
         await notify(
           event,
           formatApprovalCreated,
@@ -1036,20 +1148,23 @@ const plugin = definePlugin({
       });
     }
 
-    if (config.notifyOnAgentError) {
-      ctx.events.on("agent.run.failed", (event: PluginEvent) =>
-        notify(event, formatSessionFailure, errorsChannelId ?? undefined),
-      );
+    if (notifyGate.anyCompanyEnables("notifyOnAgentError")) {
+      ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
+        if (!(await notifyAllowed(event, "notifyOnAgentError"))) return;
+        await notify(event, formatSessionFailure, errorsChannelId ?? undefined);
+      });
     }
 
-    if (config.notifyOnRunStarted) {
+    if (notifyGate.anyCompanyEnables("notifyOnRunStarted")) {
       ctx.events.on("agent.run.started", async (event: PluginEvent) => {
+        if (!(await notifyAllowed(event, "notifyOnRunStarted"))) return;
         const payload = await enrichRunPayload(ctx, event);
         await notify({ ...event, payload }, formatAgentRunStarted, bdPipelineChannelId ?? undefined);
       });
     }
-    if (config.notifyOnRunFinished) {
+    if (notifyGate.anyCompanyEnables("notifyOnRunFinished")) {
       ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
+        if (!(await notifyAllowed(event, "notifyOnRunFinished"))) return;
         const payload = await enrichRunPayload(ctx, event);
         await notify({ ...event, payload }, formatAgentRunFinished, bdPipelineChannelId ?? undefined);
       });
